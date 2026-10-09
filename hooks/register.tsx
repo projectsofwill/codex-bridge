@@ -174,8 +174,8 @@ function limitsText(u: Bridge) {
 // Setup re-probes Python (the person may have just installed it) but never re-applies config mid-session:
 // tool descriptions and schemas were built at session start, so a partial reload would mislead.
 function codexRuns(s: Bridge) {
-  const live = ((s.slots ?? []) as Bridge[]).filter(h => !h.stale)
-  const workers = live.filter(h => h.owner?.kind === 'worker').length
+  const live = ((s.slots ?? []) as Bridge[]).filter(slot => !slot.stale)
+  const workers = live.filter(slot => slot.owner?.kind === 'worker').length
   return `codex runs in flight: ${live.length} (${workers} worker job${workers === 1 ? '' : 's'}, max ${s.max_workers ? s.max_workers : 'unlimited'}; asks/gates uncapped)`
 }
 
