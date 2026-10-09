@@ -29,6 +29,7 @@ LOCK_WAIT_WORKER_S = 600
 MAX_RESUMES = 2
 ASK_DEADLINE_S = 540       # from PROCESS START: version check + attempts + teardown < the mod's 600 s cap
 TEARDOWN_MARGIN_S = 20     # end_tree can wait ~12 s; hashing + result write follow
+BIRTH_SLACK_S = 3          # worktree_procs: ps lstart resolution + Linux boot-clock skew
 PROCESS_START = time.time()
 
 HOME = Path(os.environ.get("CODEX_BRIDGE_HOME", Path.home() / ".codex-bridge"))
@@ -1381,7 +1382,9 @@ def worktree_procs(wt, since):
             born = time.mktime(time.strptime(info[1].strip(), "%a %b %d %H:%M:%S %Y"))
         except ValueError:
             continue
-        if born >= since - 1:
+        # lstart has 1 s resolution, and on Linux it is boot time + ticks, which lags the wall clock by up
+        # to ~1 s more (CI: a child of this run read 1 s older than the run's start). Hence 3 s of slack.
+        if born >= since - BIRTH_SLACK_S:
             found.add(identity(pid))
     return found
 
