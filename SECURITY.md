@@ -1,61 +1,67 @@
 # Security
 
-codex-bridge sends code to a third-party model (OpenAI Codex) and runs code that model wrote on your machine.
-This page says exactly what crosses which boundary and what the bridge does and does not enforce.
+codex-bridge sends code to a third-party model (OpenAI Codex). It also runs code from that model on your machine.
+This page tells you which data crosses which boundary. It also tells you what codex-bridge enforces and what it does
+not enforce.
 
-## What leaves your machine
+## Data that leaves your machine
 
-Everything Codex sees goes to OpenAI under your Codex account, exactly as if you ran `codex` yourself:
+All data that Codex sees goes to OpenAI under your Codex account. This is the same as when you run `codex` yourself.
 
-- **Ask / gate:** your prompt, the literal diff, and the files you name (Codex reads them read-only). Secret-bearing
-  paths (`.env*`, credentials, tokens, keys, `.git`, `.ssh`, `.aws`, `.codex`, `.gnupg`) are refused as targets,
-  and the read-canary line is never picked from a secret-looking line, PEM block or opaque token.
-- **Worker jobs:** the task spec, and whatever Codex reads while working in its worktree. **Codex's reads during a
-  worker run are restricted by prompt, not by sandbox**: it runs with `-s workspace-write`, so it can read what
-  your user account can read. Only its writes are isolated (to the worktree, then scope-checked).
+- **Ask and gate:** Codex gets your prompt, the literal diff, and the files that you name. Codex can only read these
+  files. codex-bridge refuses secret paths as targets: `.env*`, credentials, tokens, keys, `.git`, `.ssh`, `.aws`,
+  `.codex` and `.gnupg`. codex-bridge never selects the read-check line from a secret line, a PEM block or a token.
+- **Worker jobs:** Codex gets the task and the files that it reads in its worktree. **A prompt controls the reads
+  of Codex during a worker job. A sandbox does not control them.** Codex runs with `-s workspace-write`. Thus, it
+  can read the files that your user account can read. codex-bridge isolates only the writes of Codex: to the
+  worktree, with a scope check after the job.
 
-The Claude reviewer runs in your Claude Code session under your Anthropic account, as any subagent does.
+The Claude reviewer runs in your Claude Code session under your Anthropic account. This is the same as all subagents.
 
-Nothing else is sent anywhere. Telemetry is a local JSONL file.
+codex-bridge sends no other data. The cost log is a local JSONL file.
 
-## What runs on your machine, and how it is contained
+## Code that runs on your machine
 
-Worker-written code runs when the bridge re-runs your tests. That re-run happens inside `codex sandbox` with a
-bridge-written profile:
+Code from a worker runs when codex-bridge runs your tests again. That test run occurs inside `codex sandbox` with a
+profile from codex-bridge:
 
-- network disabled;
-- writes limited to the worktree and a temp directory;
-- denied: `~/.ssh`, `~/.codex`, `~/.aws`, `~/.config`, `~/.claude`, `~/Library/Keychains`, `~/Documents`,
-  `~/Desktop`, `~/Downloads`, the bridge's job records, and any `workspace_roots` you configure;
-- inside the worktree, `.env*`, credentials, tokens, `*.pem`, `*.key` and SSH keys denied;
-- an allowlisted environment (no API keys or tokens inherited from your shell).
+- The network is off.
+- Writes go only to the worktree and to a temporary directory.
+- The sandbox blocks these paths: `~/.ssh`, `~/.codex`, `~/.aws`, `~/.config`, `~/.claude`,
+  `~/Library/Keychains`, `~/Documents`, `~/Desktop`, `~/Downloads`, the job records of codex-bridge, and all
+  `workspace_roots` that you set.
+- Inside the worktree, the sandbox blocks `.env*`, credentials, tokens, `*.pem`, `*.key` and SSH keys.
+- The environment contains only approved variables. The test run gets no API keys or tokens from your shell.
 
-**This is a deny-list, not an allow-list.** Home paths not listed above remain readable to the test run. With the
-network off, such data could only leave through the diff, which the receipt and the reviewer both see, and which
-you review before merging.
+**The sandbox uses a block list, not an allow list.** The test run can read the home paths that the list above
+does not include. The network is off. Thus, this data can leave only through the diff. The receipt and the reviewer
+both show the diff, and you examine it before you merge.
 
-`/codex-bridge setup` runs a selftest that must observe a real permission denial for each forbidden action (not a
-crash or a missing interpreter) before worker jobs are unlocked on that machine. The proof is tied to the Codex
-version, OS and machine.
+`/codex-bridge setup` runs a selftest. For each blocked action, the selftest must see a real permission error. A
+crash or a missing interpreter does not count. Worker jobs stay locked on a machine until the selftest passes. The
+proof applies to one Codex version, one operating system and one machine.
 
-## What the bridge never does
+## Actions that codex-bridge never does
 
-- merge, commit, push, or apply a worker's diff;
-- apply a worker's suggested edit to a protected file;
-- edit `~/.codex/config.toml`;
-- run two Codex dispatches at once (on one machine, among bridge calls).
+- It never merges, commits, pushes or applies the diff of a worker.
+- It never applies a suggested change from a worker to a protected file.
+- It never changes `~/.codex/config.toml`.
+- It never runs more than `max_workers` worker jobs at the same time on one machine.
 
 ## Known gaps
 
-- Worker-run reads (above).
-- Codex used outside the bridge, and other machines, are not coordinated with the bridge's lock.
-- End-of-job process cleanup is best-effort; a process that double-forks out of the job's process group and is not
-  an orphan in the worktree can survive.
-- The usage-limit read uses an experimental Codex endpoint.
+- Codex reads during a worker job (refer to "Data that leaves your machine").
+- The worker limit does not count Codex runs outside codex-bridge or on other machines.
+- Process cleanup at the end of a job is not complete. A process can stay alive if it leaves the process group of
+  the job. This occurs when the process also has a parent process or runs outside the worktree.
+- codex-bridge reads the usage limits through an experimental Codex endpoint.
 
-## Reporting a vulnerability
+## Report a vulnerability
 
-Please report privately via GitHub: **Security → Report a vulnerability** on this repository
-(private security advisory). Do not open a public issue for a vulnerability. Include the version
-(`plugins/codex-bridge/.claude-plugin/plugin.json`), your OS, `codex --version`, and a minimal reproduction.
-This is a single-maintainer project; expect an acknowledgement within a week.
+1. On GitHub, open this repository.
+2. Select **Security**, then **Report a vulnerability**. This makes a private security advisory.
+3. Include the version (from `plugins/codex-bridge/.claude-plugin/plugin.json`), your operating system, the output
+   of `codex --version`, and the minimum steps to show the problem.
+
+Do not open a public issue for a vulnerability. One person maintains this project. You get a reply in one week or
+less.

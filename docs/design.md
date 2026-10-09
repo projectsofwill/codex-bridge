@@ -1,191 +1,255 @@
 # codex-bridge design
 
-How the bridge works and why each rule exists. Section markers like `(2c.5)` in code comments refer to the build
-history this document condenses.
+This document tells how codex-bridge works and why each rule exists. Some code comments contain section markers,
+for example `(2c.5)`. These markers refer to the build history that this document summarizes.
 
-## Shape
+## Structure
 
 ```
 plugins/codex-bridge/
-  hooks/register.tsx   thin Claude Code layer: tools, slash command, band, reviewer spawn, watcher timer
-  bridge/bridge.py     the logic, stdlib-only Python: lock, jobs, supervisor, sandbox, receipt, grounding, telemetry
-  bridge/prompts/      the prompts Codex and the reviewer get (ask, gate, resume, worker, reviewer)
+  hooks/register.tsx   thin Claude Code layer: tools, slash command, band, reviewer start, watcher timer
+  bridge/bridge.py     the logic, standard-library Python: slots, jobs, supervisor, sandbox, receipt, read checks, cost log
+  bridge/prompts/      the prompts for Codex and the reviewer (ask, gate, resume, worker, reviewer)
 ```
 
-Every `bridge.py` subcommand prints exactly one JSON object. Free text (prompts, diffs, specs) travels as JSON on
-stdin, never argv, so no shell ever parses it. The mod treats a bridge call that fails to start, times out or
-prints no JSON as `{ok: false}`: callers fail closed, never on an exception path.
+Each `bridge.py` subcommand prints one JSON object. Free text (prompts, diffs, specifications) goes as JSON on stdin,
+not as arguments. Thus, no shell reads the text. Sometimes a bridge call does not start, stops at its time limit, or
+prints no JSON. The mod then uses `{ok: false}`, and the caller refuses the action. An exception never decides an
+outcome.
 
-The split exists so the part that decides outcomes is plain, unit-tested Python with a fake `codex` binary, and the
-mod only displays and routes. The watcher timer in the mod never decides an outcome.
+The part that decides outcomes is Python with unit tests and a fake `codex` binary. The mod only shows data and
+sends requests. The watcher timer in the mod never decides an outcome.
 
 ## State
 
-Machine-local, outside every repository: `~/.codex-bridge/` (override with `CODEX_BRIDGE_HOME`).
+All state is on the local machine, outside all repositories: `~/.codex-bridge/`. To change this location, set
+`CODEX_BRIDGE_HOME`.
 
-| Path | Holds |
+| Path | Content |
 |---|---|
 | `jobs/<id>/` | `job.json` (inputs, machine, owner session, base revision), `state.json`, receipt, verdict, logs |
-| `worktrees/<id>/` | the job's git worktree (detached at HEAD) |
-| `codex.lock` | the one Codex slot, with the holder's identity |
-| `selftest.json` | this machine's sandbox proof |
-| `burn.jsonl` | one cost line per call (path configurable) |
+| `worktrees/<id>/` | the git worktree of the job (detached at HEAD) |
+| `slots/<token>.json` | one file for each running Codex run: owner, holder identity, process tree |
+| `selftest.json` | the sandbox proof for this machine |
+| `burn.jsonl` | one cost line for each call (you can set the path) |
 
-Every state write is atomic (temp file + rename). Records from another machine are informational; their process
-ids are never interpreted locally.
+Each state write is atomic (a temporary file, then a rename). Records from other machines are for information only.
+codex-bridge never uses their process IDs on the local machine.
 
-## One Codex at a time
+## Parallel runs
 
-Codex is one session per account, so the bridge never overlaps its own Codex runs. The lock is created with its
-full content atomically, records the owner's process identity (pid **plus** start time, so a reused pid can't
-impersonate a dead owner), and a stale lock is reclaimed under a mutex that removes only the exact lock judged
-dead. An ask waits up to 120 s for the slot, a worker up to 10 min; both then refuse rather than run in parallel.
+In Codex, "one session per account" means one *login*. A new `codex login` cancels the other logins. Many
+processes can use one login at the same time. We tested three parallel runs before this design. Thus, asks and gates
+never wait. Only `max_workers` (default 3) limits worker jobs. Each worker also starts a sandboxed test run and a
+Claude review. The limit also stops a bad plan that starts ten jobs.
 
-What the lock cannot see: Codex run by hand, other tools that run Codex, other machines. That is stated in the tool
-descriptions rather than pretended away.
+Each Codex run holds a slot file in `slots/`. codex-bridge writes the file atomically. The file records the process
+identity of the owner and the Codex process tree. The identity is the process ID **and** the start time. Thus, a
+new process with a reused ID cannot act as a dead owner.
+
+codex-bridge counts the worker slots and makes a new slot inside one mutex. Thus, two starts cannot both get the last
+place. A test starts eight processes at the same time with a limit of three. Exactly three get a slot. codex-bridge
+removes a dead slot. If a slot is orphaned (the holder is dead, but Codex still runs), codex-bridge first stops
+the Codex process tree. The `start` command reserves a place for its worker with a short lease. The supervisor of
+the job then takes the reservation.
+
+**Quota attribution.** Usage windows apply to the full account. Thus, a reading before and after a call gives the
+cost of that call only if no other run occurred at the same time. A run counter finds each overlap. An overlapped
+call records its change as `shared_delta`, and `delta` is `null`. The cost estimate for new workers uses only
+measurements without overlap. The worker check before a job also includes the expected cost of the running workers.
+
+**Authentication.** OpenAI replaces the refresh token of the login each time that a process uses it. If two runs
+refresh at the same time, one run can fail. We did not see this failure, and we did not test it. codex-bridge tries
+again one time after an authentication error. An ask always tries again. A worker tries again only if its worktree
+did not change.
+
+codex-bridge does not count Codex runs outside codex-bridge or on other machines.
 
 ## Ask and gate (`codex` tool)
 
-Codex runs read-only (`-s read-only --strict-config --json`), the prompt over stdin, output to a fresh file that
-this run must have created.
+Codex runs read-only (`-s read-only --strict-config --json`). The prompt goes on stdin. The output goes to a new
+file. This run must make that file.
 
-**Grounding.** Codex's JSON events show commands but not which files were actually read (a command that failed to
-read a file can still exit 0). So for each named file the bridge picks a random line (skipping secret-looking
-lines, PEM blocks and opaque tokens) and requires Codex to quote it verbatim in a `READ-RECEIPT` block. A missing or
-wrong quote means no read evidence for that file, and `gate_satisfied` is false. Deleted files and inline-diff-only
-targets are checked against the embedded diff instead.
+**Read checks.** The JSON events of Codex show commands. They do not show which files Codex read. A command that
+does not read a file can still exit with 0. Thus, for each named file, codex-bridge selects a random line. It does not
+select secret lines, PEM blocks or tokens. Codex must quote the line exactly in a `READ-RECEIPT` block. If the quote
+is missing or wrong, the file has no read evidence, and `gate_satisfied` is false. For deleted files and targets
+that exist only in the diff, codex-bridge compares the quote with the diff.
 
-**Objections.** Codex tags context problems `NEED-FILE <path>` or `BLOCKER`. The bridge resumes the same Codex
-thread (at most twice) only for `NEED-FILE` naming a file the caller named; anything else is a computed blocker.
-Any unresolved objection blocks `gate_satisfied: true`, even with every canary passing. An early version resumed on
-every objection and burned 310K input tokens on one unresolvable one.
+**Objections.** Codex marks problems with its context as `NEED-FILE <path>` or `BLOCKER`. codex-bridge continues the
+same Codex thread (two times maximum) only for a `NEED-FILE` that names a file from the caller. All other objections
+are blockers. An open objection blocks `gate_satisfied: true`, even when all read checks pass. An early version
+continued after each objection. It used 310K input tokens on one objection that it could not solve.
 
-**Freshness.** Named files and HEAD are re-hashed at the end; a change during the run is a blocker.
+**Freshness.** At the end, codex-bridge calculates the hashes of the named files and HEAD again. A change during the
+run is a blocker.
 
-**Budget.** The mod's process call caps at 10 minutes, so lock wait plus all attempts plus teardown must fit 540 s
-from process start; a gate that needs longer fails closed with "budget exhausted".
+**Time limit.** The mod stops a process call after 10 minutes. Thus, all attempts and the cleanup must finish in
+540 seconds from the process start. If a gate needs more time, it fails with "budget exhausted".
 
-The reply separates **computed** fields (receipt, model, quota delta, `gate_satisfied`) from **Codex's words**
-(objections, findings), which are relayed verbatim and never re-graded.
+The reply keeps **calculated** fields (receipt, model, quota change, `gate_satisfied`) separate from the **words of
+Codex** (objections, findings). codex-bridge sends the words of Codex without changes and never grades them again.
 
 ## Model choice
 
-The bridge, not the caller, picks model and effort: a gate from its stakes, a worker from its tier, an ask at
-`standard/medium`. Claude may only raise. Code-enforced allowed sets: ask and gate never run on the `cheap` role
-(the gate *is* the check); workers may (their work is re-verified and reviewed). Effort is low/medium/high, never
-above. One exception to raise-only: a worker may run below its mapping with an `experiment` label, logged, which is
-how the benchmark compared models. Quota never downgrades a model; it refuses.
+codex-bridge, not the caller, selects the model and effort. A gate gets them from its risk. A worker gets them from
+its tier. An ask uses `standard/medium`. Claude can only increase them. The code enforces the allowed sets. Asks
+and gates never use the `cheap` role, because the gate *is* the check. Workers can use it, because codex-bridge
+checks and reviews their work. Effort is low, medium or high, never more. There is one exception to "increase only":
+a worker can use a lower model with an `experiment` label. codex-bridge logs this. The benchmark used it to compare
+models. The quota never lowers a model. If the quota is too low, codex-bridge refuses the call.
 
 ## Worker jobs
 
 ### Intake
 
-Required: task, scope, verify command, tier, definition of done, the **verifier manifest** (every file the verify
-run trusts: tests, conftest, fixtures, configs, helpers), and an **attestation**: the driver's written judgment
-that the task is safe to delegate. The attestation is recorded as *claimed*, never computed: the bridge can't judge
-consequence, so it records who did.
+A worker job needs these inputs:
 
-Mechanical refusals on top: secret paths (`.env*`, credentials, keys, `.git`, `.ssh`, `.aws`, `.codex`, ...) are
-never readable or writable; protected paths (agent and automation config, plus your `protected_paths`) are
-readable but a scope that would write them is refused. Matching is case-insensitive (case-insensitive filesystems
-made `Context/` slip past `context/`) and symlinks anywhere in a path chain are refused. A worker may write
-`.bridge-suggested.patch` for a protected file: it is moved out before accounting, shown separately, never applied.
+- the task
+- the scope
+- the verify command
+- the tier
+- the definition of done
+- the **verifier manifest**: all files that the test run uses (tests, conftest, fixtures, configuration files,
+  helpers)
+- an **attestation**: a statement from the caller that the task is safe to send
 
-Verify commands use **one** test runner. Summing several runners' summaries kept producing false-clean routes, so
-output with two runners' summaries parses as nothing, and nothing is never clean.
+codex-bridge records the attestation as *claimed*, never as calculated. codex-bridge cannot judge the risk, so it
+records who judged it.
+
+codex-bridge also refuses some paths mechanically. Secret paths (`.env*`, credentials, keys, `.git`, `.ssh`, `.aws`,
+`.codex` and others) are never readable or writable. Protected paths (agent and automation configuration, and your
+`protected_paths`) are readable. codex-bridge refuses a scope that writes to them. The comparison ignores case,
+because on some file systems `Context/` and `context/` are the same folder. codex-bridge refuses symbolic links at
+all levels of a path. A worker can write `.bridge-suggested.patch` for a protected file. codex-bridge moves this
+file out before the accounting, shows it separately, and never applies it.
+
+A verify command must use **one** test runner. When codex-bridge added the summaries of several runners, some
+failing runs looked clean. Thus, output with the summaries of two runners gives no result, and no result is never
+clean.
 
 ### Supervisor
 
-`bridge.py supervise` runs detached (new session on POSIX; detached process group on Windows) and owns the Codex
-child. It holds the 60-minute ceiling itself, independent of the Claude session; kills the whole tree at the
-deadline; writes the terminal state atomically; and releases the lock only once every tracked process is dead.
-After Codex exits it also kills orphaned processes (parent pid 1) born during the run whose working directory is
-inside the worktree. A process with a living parent is never touched, so a person's own shell is safe.
+`bridge.py supervise` runs detached. On POSIX it uses a new session. On Windows it uses a detached process group.
+The supervisor owns the Codex child process. It enforces the 60-minute limit itself, without the Claude session. It
+stops the full process tree at the limit. It writes the final state atomically. It releases its slot only when all
+recorded processes are dead.
+
+After Codex stops, the supervisor also stops orphaned processes (parent process ID 1) that started during the run
+inside the worktree. It never stops a process that has a living parent. Thus, your own shell is safe.
 
 ### Lifecycle
 
 ```
 pending -> running -> exited -> receipted -> reviewing -> reviewed -> notified
-terminal also: timeout, crashed, refused, cancelled, discarded
+other final states: timeout, crashed, refused, cancelled, discarded
 ```
 
-A job that finished while Claude was closed is simply `exited`; the next session picks it up. A job is `crashed`
-only when its supervisor is dead **and** it has no terminal state. Timeout and crash worktrees are kept and marked
-quarantined, since a partial diff can still be useful. `codex_discard` removes a worktree on request and refuses
-while the job runs.
+If a job finishes while Claude is closed, its state is `exited`. The next session continues the job. A job is
+`crashed` only when its supervisor is dead **and** it has no final state. codex-bridge keeps the worktrees of
+`timeout` and `crashed` jobs and marks them as quarantined. A partial diff can still be useful. `codex_discard`
+removes a worktree when you ask. It refuses while the job runs.
 
-Receipt computation and review each take an exclusive claim file, so two sessions never compute the same receipt
-or spawn two reviewers. Reports carry a lease: the session that started a job reports it; another session on the
-same machine takes over only after the job has sat unclaimed for 3 minutes.
+The receipt calculation and the review each take an exclusive claim file. Thus, two sessions never calculate the
+same receipt or start two reviewers. Each report has a lease. The session that started a job reports it. Another
+session on the same machine takes the report only if the job has no claim for 3 minutes.
 
 ### Receipt
 
-Order matters: verify first, then account, so changes made by the verify run count.
+The order is important. codex-bridge first runs the tests and then does the accounting. Thus, the accounting
+includes the changes from the test run.
 
-1. Codex exited 0 with a fresh final-message file, else `crashed`.
-2. Verify re-run in the sandbox (below), with a 20-minute cap and every descendant dead before accounting.
-3. Accounting: `git add -A`, diff, deleted files and tests, manifest hashes, `status --ignored`, out-of-scope paths.
-   Any git error or unreadable path is `incomplete-scan`.
-4. A snapshot hash binds the binary diff, manifest hashes and non-build ignored files. A verdict carries the
-   snapshot it reviewed; if the worktree changes afterwards, the verdict is stale.
+1. Codex must exit with 0 and write a new final-message file. If not, the outcome is `crashed`.
+2. codex-bridge runs the tests again in the sandbox (refer to "Sandboxed verify"). The limit is 20 minutes. All
+   child processes must be dead before the accounting.
+3. The accounting: `git add -A`, the diff, deleted files and tests, manifest hashes, `status --ignored`, and paths
+   outside the scope. A git error or an unreadable path gives `incomplete-scan`.
+4. A snapshot hash includes the binary diff, the manifest hashes and the ignored files that are not build files. A
+   verdict includes the snapshot that it reviewed. If the worktree changes after the review, the verdict is stale.
 
-Outcome precedence: `crashed > incomplete-scan > out-of-scope > verifier-modified > mismatch > verify-failed >
-clean`. Zero tests executed is `verify-failed`, never clean. Two matching red runs are `verify-failed` (the claim
-was honest, the code fails).
+Outcome priority: `crashed > incomplete-scan > out-of-scope > verifier-modified > mismatch > verify-failed > clean`.
+If no tests ran, the outcome is `verify-failed`, never clean. If both runs fail in the same way, the outcome is
+`verify-failed`. The claim of Codex was true, but the code fails.
 
 ### Sandboxed verify
 
-`codex sandbox -P bridge-verify` with a profile the bridge writes into its own `CODEX_HOME` (your
-`~/.codex/config.toml` is never edited). It extends Codex's `:read-only` with: worktree and tmp writable; denied
-`~/.ssh ~/.codex ~/.aws ~/.config ~/.claude ~/Library/Keychains ~/Documents ~/Desktop ~/Downloads`, the bridge's own
-job records and your `workspace_roots`; `.env*`, credentials, tokens and key files denied inside the worktree;
-network off. The environment is an allowlist (PATH, HOME, locale, temp dirs and the Windows basics), never a copy
-of yours.
+codex-bridge uses `codex sandbox -P bridge-verify` with a profile in its own `CODEX_HOME`. It never changes your
+`~/.codex/config.toml`. The profile extends the `:read-only` profile of Codex:
 
-Python dependencies: a job may name virtualenvs; their `site-packages` is exposed read-only via `PYTHONPATH` and the
-base interpreter runs the tests (a venv's own `python` resolves through denied parents). The venv must match the
-interpreter's version and contain no secret-looking files.
+- The worktree and the temporary directory are writable.
+- These paths are blocked: `~/.ssh ~/.codex ~/.aws ~/.config ~/.claude ~/Library/Keychains ~/Documents ~/Desktop
+  ~/Downloads`, the job records of codex-bridge, and your `workspace_roots`.
+- Inside the worktree, `.env*`, credentials, tokens and key files are blocked.
+- The network is off.
 
-`selftest` proves this on each machine (write outside, read `.env`, network, environment secret, workspace and
-`~/.ssh` reads must all be *denied* with a real permission error, not merely fail; running and writing inside must
-work) and binds the proof to the Codex version, platform and machine.
+The environment contains only approved variables: `PATH`, `HOME`, locale settings, temporary directories and the
+basic Windows variables. It is never a copy of your environment.
+
+Python dependencies: a job can name virtual environments. The sandbox gives their `site-packages` folder read-only
+through `PYTHONPATH`. The base interpreter runs the tests, because the `python` of a virtual environment points
+through blocked folders. The virtual environment must have the same Python version as the interpreter. It must not
+contain files that look like secrets.
+
+`selftest` proves the sandbox on each machine. These actions must all fail with a real permission error:
+
+- a write outside the worktree
+- a read of `.env`
+- a network connection
+- a read of a secret environment variable
+- reads of the workspace and `~/.ssh`
+
+A run and a write inside the worktree must succeed. The proof applies to one Codex version, one platform and one
+machine.
 
 ### Review
 
-Only `clean` jobs are reviewed automatically, at the depth the tier configures (default R0 none, R1 Sonnet,
-R2 Opus; R0 escalates to Sonnet when tests changed). The reviewer is a Claude subagent type registered by the mod,
-restricted to Read, Grep and Glob, given an immutable packet: task, definition of done, tier, scope, manifest,
-named companion files (regular, committed, in-repo files only), baseline test counts, receipt, diff and raw verify
-output, with diff and worker text marked untrusted.
+codex-bridge automatically reviews only `clean` jobs. The tier sets the depth. The default is no review for R0,
+Sonnet for R1 and Opus for R2. If an R0 job changed tests, it gets a Sonnet review.
 
-It must return a requirement-by-requirement assessment and a verdict block. In code: an `accept` with any
-requirement not literally `met: true`, a missing disposition for a changed test, or a missing companion is
-downgraded to `fix-list`; a verdict that can't be parsed gets one re-review, then is recorded `invalid`. When the
-recorded verdict differs from the reviewer's words, the main session gets a correction, so a downgraded accept
-never reads as green.
+The reviewer is a Claude subagent type from the mod. Its model is set for each tier, not from the model of your
+session. Each review records the model that it used. The reviewer can use only Read, Grep and Glob. It gets a
+packet that cannot change. The packet contains:
 
-`codex_diagnose` runs the Opus reviewer on demand for a job that wasn't clean, to tell a defect from a bad test or a
-spec conflict. The job stays unaccepted either way.
+- the task, the definition of done, the tier, the scope and the manifest
+- the named companion files (normal, committed files inside the repository only)
+- the baseline test counts
+- the receipt, the diff and the raw test output
+
+The packet marks the diff and the text of the worker as untrusted.
+
+The reviewer must give an assessment for each requirement and a verdict block. The code then applies these rules:
+
+- If an `accept` has a requirement that is not exactly `met: true`, it becomes `fix-list`.
+- If an `accept` does not examine a changed test, it becomes `fix-list`.
+- If an `accept` has a missing companion file, it becomes `fix-list`.
+- If codex-bridge cannot read the verdict, it starts one more review. After a second failure, it records `invalid`.
+
+If the recorded verdict is different from the words of the reviewer, the main session gets a correction. Thus, a
+changed `accept` never looks like a pass.
+
+`codex_diagnose` runs the Opus reviewer on a job that is not clean. The reviewer finds the cause: a defect, a bad
+test or a spec conflict. The job stays not accepted.
 
 ## Usage limits
 
-Before and after each call the bridge reads the account's limits from `codex app-server`
-(`account/rateLimits/read`, no model turn, under a second). Asks and gates refuse only when a limit is already hit
-and warn above 85%. Workers refuse above the configured caps until three measured runs exist, then when the median
-measured cost won't fit. The delta per call goes to the cost log. The endpoint is experimental; a failed read is
-"unknown", never a block.
+Before and after each call, codex-bridge reads the account limits from `codex app-server`
+(`account/rateLimits/read`). This read uses no model turn and takes less than one second. Asks and gates refuse only
+when a limit is already reached. They show a warning above 85%. Workers refuse above the set limits until three
+measured runs exist. After that, a worker refuses when the median measured cost does not fit. The change for each
+call goes to the cost log. The endpoint is experimental. If the read fails, the result is "unknown". An unknown
+result never blocks a call.
 
-## Telemetry
+## Cost log
 
-One JSONL line per call: lane, outcome, model and reason, quota delta, Codex tokens, reviewer tokens, result size.
-`total_claude_tokens` is always `null` with a note: the mod can't see main-loop token usage, and a fake 0 once read
-as "free".
+The cost log has one JSONL line for each call. Each line records the lane, outcome, model and reason, and quota
+change. It also records the Codex tokens, the reviewer model and tokens, and the result size. `total_claude_tokens` is always `null` with a note. The mod cannot see the token
+use of the main session. An earlier value of 0 looked like "free".
 
 ## Known limits
 
-- The worker's own reads during the Codex run are restricted by prompt only (`-s workspace-write`); only the
-  verify re-run is sandboxed. Writes are isolated to the worktree and scope-checked.
-- The sandbox profile is a deny-list: home paths not listed stay readable to the verify run (network is off, so
-  data can only leave through the diff, which the receipt and reviewer see).
-- Cross-machine and non-bridge Codex use are not coordinated.
-- Process cleanup is best-effort (a process that double-forks fast enough can escape).
+- During the Codex run of a worker, only a prompt controls the reads (`-s workspace-write`). Only the test run is in
+  the sandbox. The writes of the worker go to the worktree, and a scope check follows.
+- The sandbox profile uses a block list. The test run can read the home paths that the list does not include. The
+  network is off. Thus, data can leave only through the diff, and the receipt and the reviewer show the diff.
+- codex-bridge does not count Codex runs on other machines or outside codex-bridge.
+- Process cleanup is not complete. A process that leaves the process group fast enough can stay alive.

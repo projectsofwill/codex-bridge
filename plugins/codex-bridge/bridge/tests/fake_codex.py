@@ -42,6 +42,16 @@ if argv[:1] == ["exec"]:
     if os.environ.get("FAKE_CODEX_CHILD"):  # leave a grandchild running in a new session (setsid escape)
         subprocess.Popen(["sleep", "300"], start_new_session=True)
     time.sleep(sleep)
+
+    def auth_fail():  # FAKE_CODEX_AUTH_FAIL_ONCE=<marker file>: the first run fails on auth, later runs work
+        marker = os.environ.get("FAKE_CODEX_AUTH_FAIL_ONCE")
+        if os.environ.get("FAKE_CODEX_AUTH_FAIL_ALWAYS") or (marker and not os.path.exists(marker)):
+            if marker:
+                open(marker, "w").close()
+            print("Error: 401 Unauthorized: refresh token was already used", file=sys.stderr, flush=True)
+            sys.exit(1)
+    if not os.environ.get("FAKE_CODEX_AUTH_FAIL_LATE"):
+        auth_fail()
     edit = os.environ.get("FAKE_CODEX_EDIT")  # "path=content;path2=content2"
     if edit:
         for pair in edit.split(";"):
@@ -50,6 +60,7 @@ if argv[:1] == ["exec"]:
             os.makedirs(os.path.dirname(full) or cwd, exist_ok=True)
             with open(full, "w", encoding="utf-8") as f:
                 f.write(content)
+    auth_fail()  # LATE: after the edit, so the worktree is no longer untouched
     reply = os.environ.get("FAKE_CODEX_REPLY", "answer")
     if "{{ECHO_CANARIES}}" in reply:  # quote the requested lines truthfully
         lines = []

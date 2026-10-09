@@ -25,10 +25,9 @@ from pathlib import Path
 
 WORKER_CEILING_S = 60 * 60     # hard ceiling, enforced by the supervisor, not the session
 VERIFY_CEILING_S = 20 * 60
-LOCK_WAIT_ASK_S = 120
 LOCK_WAIT_WORKER_S = 600
 MAX_RESUMES = 2
-ASK_DEADLINE_S = 540       # from PROCESS START: version check + lock wait + attempts + teardown < the mod's 600 s cap
+ASK_DEADLINE_S = 540       # from PROCESS START: version check + attempts + teardown < the mod's 600 s cap
 TEARDOWN_MARGIN_S = 20     # end_tree can wait ~12 s; hashing + result write follow
 PROCESS_START = time.time()
 
@@ -119,6 +118,7 @@ DEFAULT_CONFIG = {
     "workspace_roots": [],  # extra roots whose protected areas also deny a worker repo / worktree
     "log_path": None,       # cost log (JSONL); default ~/.codex-bridge/burn.jsonl
     "worker_refuse_pct": {"primary": 70, "secondary": 85},  # until MIN_SAMPLES measured runs exist
+    "max_workers": 3,       # worker jobs running at once on this machine; 0 = no cap. Asks/gates never wait.
 }
 REVIEWERS = ("none", "sonnet", "opus")
 
@@ -168,6 +168,9 @@ def load_config():
     pct = cfg["worker_refuse_pct"]
     if set(pct) != {"primary", "secondary"} or not all(isinstance(x, (int, float)) and 0 < x <= 100 for x in pct.values()):
         problems.append("worker_refuse_pct needs primary and secondary in (0, 100]")
+    mw = cfg["max_workers"]
+    if isinstance(mw, bool) or not isinstance(mw, int) or mw < 0:
+        problems.append("max_workers must be a whole number >= 0 (0 = no cap)")
     if problems:
         fail(f"config {p} is invalid", problems=problems)
     return cfg
@@ -186,6 +189,7 @@ STAKES = {n: (CFG["models"][r], e) for n, (r, e) in CFG["stakes"].items()}
 GATE_TRIGGERS = {**STAKES, **{a: STAKES[t] for a, t in CFG["stakes_aliases"].items()}}
 TIER_DEFAULT = {t: (CFG["models"][r], e) for t, (r, e) in CFG["tiers"].items()}
 WORKER_REFUSE_PCT = CFG["worker_refuse_pct"]
+MAX_WORKERS = CFG["max_workers"]
 _extra = [x.strip().replace("\\", "/").casefold() for x in CFG["protected_paths"]]
 PROTECTED_PREFIXES = DEFAULT_PROTECTED_PREFIXES + tuple(x for x in _extra if x.endswith("/"))
 PROTECTED_NAMES = DEFAULT_PROTECTED_NAMES | {x for x in _extra if not x.endswith("/")}
@@ -197,7 +201,8 @@ def cmd_config():
     """What the mod needs to build its tools: stakes names, aliases, reviewers per tier, model roles."""
     return {"ok": True, "path": str(config_path()), "models": CFG["models"], "stakes": sorted(CFG["stakes"]),
             "stakes_aliases": CFG["stakes_aliases"], "review": CFG["review"],
-            "protected": sorted(PROTECTED_PREFIXES) + sorted(PROTECTED_NAMES), "log_path": str(LOG_PATH)}
+            "protected": sorted(PROTECTED_PREFIXES) + sorted(PROTECTED_NAMES), "log_path": str(LOG_PATH),
+            "max_workers": MAX_WORKERS}
 
 
 def run(argv, **kw):
@@ -251,20 +256,32 @@ def alive(ident):
     return start != "None" and proc_start(int(pid)) == start
 
 
-# ---------------------------------------------------------------- the one Codex lock (2.0)
-# Codex is one session per account: one dispatch at a time, held by the
-# process that runs Codex (an `ask` run or a worker supervisor), released once its tree is dead.
-
-def lock_path():
-    return HOME / "codex.lock"
-
-
-# The lock is the ONE Codex dispatch slot (Codex = one session per account).
-# It is held while ANY of these holds (gate finding 1):
+# ---------------------------------------------------------------- Codex dispatch slots (2.0; concurrent since 0.3.0)
+# One slot file per Codex dispatch, held by the process that runs Codex (an `ask` run or a worker
+# supervisor) and released once its tree is dead. Codex's "one session per account" means one LOGIN, not
+# one running process (3 parallel runs on one login: tested 2026-10-08), so asks and gates never wait.
+# Only worker jobs are capped (`max_workers`): each drags a sandboxed re-run and a Claude review behind it.
+#
+# A slot is held while ANY of these holds (gate finding 1):
 #   - its holder process is alive, or
-#   - its lease has not expired (a subagent that runs Codex itself, renewed by the mod), or
+#   - its lease has not expired (`start` reserving the slot its supervisor takes over), or
 #   - any recorded member of the Codex process tree is alive (a supervisor's death frees nothing).
 # An orphaned tree (holder dead, members alive) is killed before the slot is reclaimed.
+
+def slots_dir():
+    return HOME / "slots"
+
+
+def slot_path(token):
+    return slots_dir() / f"{token}.json"
+
+
+def slots():
+    """(path, body) for every readable slot file on this machine."""
+    if not slots_dir().is_dir():
+        return []
+    return [(p, b) for p in sorted(slots_dir().glob("*.json")) if (b := read_json(p)) is not None]
+
 
 def lock_held(h):
     if not h:
@@ -283,9 +300,18 @@ def orphaned(h):
             and any(alive(m) for m in h.get("tree", [])))
 
 
+def is_worker(h):
+    return (h.get("owner") or {}).get("kind") == "worker"
+
+
 def lock_holder():
-    h = read_json(lock_path())
-    return {**h, "stale": True} if h and not lock_held(h) else h
+    """Every dispatch slot on this machine, stale ones flagged ([] when Codex is idle here)."""
+    return [h if lock_held(h) else {**h, "stale": True} for _, h in slots()]
+
+
+def running_workers(exclude_job=None):
+    return [h for _, h in slots()
+            if is_worker(h) and lock_held(h) and (h.get("owner") or {}).get("job") != exclude_job]
 
 
 def kill_identities(idents):
@@ -306,13 +332,13 @@ def kill_identities(idents):
     return not any(alive(i) for i in idents)
 
 
-def _reclaim(seen):
-    """Remove a dead slot, under the slot mutex, only if it is still the exact lock judged dead.
+def _reclaim(path, seen):
+    """Remove a dead slot, under the slot mutex, only if it is still the exact slot judged dead.
     Orphaned Codex members (holder dead, lease over, tree alive) are killed first; if they won't die,
     no reclaim."""
     try:
         with slot_mutex():
-            cur = read_json(lock_path())
+            cur = read_json(path)
             if cur != seen:
                 return
             if orphaned(cur):
@@ -322,52 +348,81 @@ def _reclaim(seen):
                 else:
                     return
             if not lock_held(cur):
-                lock_path().unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
     except TimeoutError:
         time.sleep(0.2)
 
 
-def lock_acquire(owner, wait_s, lease_s=None, takeover_job=None):
-    """Take the slot. lease_s: a timed lease with no holder process (old agents, renewed by the mod).
-    takeover_job: a supervisor inheriting the lease its own `start` took for that job."""
-    HOME.mkdir(parents=True, exist_ok=True)
-    deadline = time.time() + wait_s
-    body = {"owner": owner, "since": now(), "machine": machine(), "tree": [],
-            "holder": None if lease_s else identity(), "token": uuid.uuid4().hex,
-            "lease_until": time.time() + lease_s if lease_s else None}
-    tmp = HOME / f".lock.{uuid.uuid4().hex}.tmp"
-    tmp.write_text(json.dumps(body), encoding="utf-8")
+def _next_seq():
+    """Dispatch counter (call under the slot mutex): a run whose counter moved on was overlapped."""
+    f = HOME / "slots.seq"
     try:
-        while True:
-            try:
-                os.link(tmp, lock_path())  # atomic create WITH content: no half-written lock is ever visible
-                return None, body["token"]
-            except FileExistsError:
-                h = read_json(lock_path())
-                if takeover_job and h and (h.get("owner") or {}).get("job") == takeover_job:
-                    with slot_mutex():  # the slot was reserved for this very job by `start`
-                        if read_json(lock_path()) == h:
-                            os.replace(tmp, lock_path())
-                            return None, body["token"]
-                    continue
-                if h is not None and (not lock_held(h) or orphaned(h)):
-                    before = read_json(lock_path())
-                    _reclaim(h)
-                    if read_json(lock_path()) != before or not lock_path().exists():
-                        continue  # reclaimed (or changed under us): retry the create
-                if time.time() >= deadline:
-                    return h or {"owner": "unreadable lock file", "path": str(lock_path())}, None
-                time.sleep(0.5 if orphaned(h) else 2)
-    finally:
-        tmp.unlink(missing_ok=True)
+        n = int(f.read_text(encoding="utf-8").strip() or 0) + 1
+    except (OSError, ValueError):
+        n = 1
+    atomic_write(f, str(n))
+    return n
+
+
+def overlapped(token):
+    """True when another Codex dispatch ran at any point during this slot's run (its quota delta then
+    mixes in their spend). Call before releasing the slot."""
+    h = read_json(slot_path(token)) or {}
+    try:
+        now_seq = int((HOME / "slots.seq").read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        return True  # unknown => never attribute a shared delta to one call
+    return bool(h.get("others_at_start")) or now_seq != h.get("seq")
+
+
+def lock_acquire(owner, wait_s, lease_s=None, takeover_job=None):
+    """Take a dispatch slot. Asks and gates always get one; a worker waits (up to wait_s) while
+    max_workers worker slots are live. lease_s: a timed lease with no holder process (`start` reserving
+    the slot its supervisor takes over). takeover_job: that supervisor. Returns (busy info or None, token)."""
+    slots_dir().mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + wait_s
+    token = uuid.uuid4().hex
+    body = {"owner": owner, "since": now(), "machine": machine(), "tree": [],
+            "holder": None if lease_s else identity(), "token": token,
+            "lease_until": time.time() + lease_s if lease_s else None}
+    worker = owner.get("kind") == "worker"
+    while True:
+        busy = None
+        try:
+            with slot_mutex():  # count + create in one critical section: two starts can't both take the last place
+                for p, h in slots():
+                    if not lock_held(h):
+                        p.unlink(missing_ok=True)  # dead and no live tree: safe to drop under the mutex
+                live = [(p, h) for p, h in slots() if lock_held(h)]
+                reserved = [p for p, h in live if takeover_job and (h.get("owner") or {}).get("job") == takeover_job]
+                workers = running_workers(exclude_job=takeover_job) if worker else []
+                if reserved or not worker or not MAX_WORKERS or len(workers) < MAX_WORKERS:
+                    write_json(slot_path(token), {**body, "seq": _next_seq(),
+                                                  "others_at_start": len(live) - len(reserved)})
+                    for p in reserved:
+                        p.unlink(missing_ok=True)  # the supervisor inherits the reservation `start` made
+                    return None, token
+                busy = {"busy": f"{len(workers)} worker job(s) running; max_workers is {MAX_WORKERS}",
+                        "running": [h.get("owner") for h in workers]}
+        except TimeoutError:
+            busy = {"busy": "slot mutex busy"}
+        before = {p for p, _ in slots()}
+        for p, h in slots():
+            if not lock_held(h) or orphaned(h):
+                _reclaim(p, h)
+        if {p for p, _ in slots()} != before:
+            continue  # something was reclaimed: re-check capacity at once
+        if time.time() >= deadline:
+            return busy, None
+        time.sleep(2)
 
 
 class slot_mutex:
-    """Serializes every read-modify-write of the slot (reclaim, update, release): no stale owner can
-    overwrite or unlink a lock someone else took in between."""
+    """Serializes every read-modify-write of the slots (acquire, reclaim, update, release): no stale
+    owner can overwrite or unlink a slot someone else took in between, and capacity is counted exactly."""
 
     def __enter__(self):
-        gate = HOME / "codex.lock.reclaim"
+        gate = HOME / "slots.mutex"
         for _ in range(200):
             try:
                 os.close(os.open(gate, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
@@ -382,24 +437,28 @@ class slot_mutex:
         raise TimeoutError("slot mutex busy")
 
     def __exit__(self, *exc):
-        (HOME / "codex.lock.reclaim").unlink(missing_ok=True)
+        (HOME / "slots.mutex").unlink(missing_ok=True)
 
 
 def lock_update(token, **fields):
     """Holder-only rewrite (record the Codex tree)."""
     with slot_mutex():
-        h = read_json(lock_path())
+        h = read_json(slot_path(token))
         if h and h.get("token") == token:
-            write_json(lock_path(), {**h, **fields})
+            write_json(slot_path(token), {**h, **fields})
             return True
         return False
 
 
 def lock_release(token):
     with slot_mutex():
-        h = read_json(lock_path())
-        if h and h.get("token") == token:
-            lock_path().unlink(missing_ok=True)
+        slot_path(token).unlink(missing_ok=True)
+
+
+# Codex failing on auth mid-flight: most likely two runs refreshing the shared login's rotating token at
+# once (untested; see the 2026-10-08 concurrency note). Retried once; a real logout fails again.
+AUTH_ERROR = re.compile(r"(?i)\b401\b|unauthori[sz]ed|refresh[ _-]?token|token[ _-]?(?:expired|revoked)"
+                        r"|invalid_grant|(?:log|sign)[ -]?in again")
 
 
 # ---------------------------------------------------------------- contained processes (gate findings 1-2)
@@ -754,6 +813,15 @@ def reset_text(w):
     return f"resets {when} (in {mins // 60}h{mins % 60:02d}m)" if mins >= 60 else f"resets {when} (in {mins} min)"
 
 
+def quota_record(before, after, shared):
+    """before/after/delta for one call. An overlapped call's delta mixes in other runs' spend: it is kept as
+    shared_delta and `delta` is None, so it never reaches the per-call cost estimate."""
+    d = quota_delta(before, after)
+    if shared:
+        return {"before": before, "after": after, "delta": None, "shared_delta": d, "overlapping": True}
+    return {"before": before, "after": after, "delta": d}
+
+
 def quota_delta(before, after):
     if not (before.get("ok") and after.get("ok")):
         return None
@@ -779,8 +847,9 @@ def estimate(lane, window):
     return statistics.median(vals) if len(vals) >= MIN_SAMPLES else None
 
 
-def preflight(lane, limits):
-    """(refusal text or None, warnings). Quota never downgrades the model: it refuses or warns."""
+def preflight(lane, limits, running=0):
+    """(refusal text or None, warnings). Quota never downgrades the model: it refuses or warns.
+    running: worker jobs already in flight, whose measured cost is still to come out of the window."""
     if not limits.get("ok"):
         return None, [f"Codex limits unknown ({limits.get('error')}); proceeding"]
     warns, blocks = [], []
@@ -788,8 +857,9 @@ def preflight(lane, limits):
         label, used = window_label(name, w), w["used"]
         if lane == "worker":
             est = estimate("worker", name)
-            if est is not None and used + est > 100:
-                blocks.append((w, f"{label} {used:.0f}% used; a worker job measures ~{est:.1f} points"))
+            if est is not None and used + est * (running + 1) > 100:
+                inflight = f" plus {running} running" if running else ""
+                blocks.append((w, f"{label} {used:.0f}% used; a worker job measures ~{est:.1f} points{inflight}"))
             elif est is None and used > WORKER_REFUSE_PCT[name]:
                 blocks.append((w, f"{label} {used:.0f}% used (> {WORKER_REFUSE_PCT[name]}% worker cap)"))
         if used >= WARN_PCT and not any(b[0] is w for b in blocks):
@@ -984,12 +1054,12 @@ def cmd_ask(req):
     version, err = codex_version()
     if not version:
         fail(f"codex unreachable: {err}")
-    holder, token = lock_acquire({"kind": mode, "pid": os.getpid()}, LOCK_WAIT_ASK_S)
-    if holder:
-        out({"ok": False, "error": "busy: another Codex dispatch holds the lock", "holder": holder}, 1)
+    holder, token = lock_acquire({"kind": mode, "pid": os.getpid()}, 0)
+    if holder:  # asks are never capped: only a jammed slot mutex lands here
+        out({"ok": False, "error": f"busy: {holder.get('busy')}", "holder": holder}, 1)
     result = None
     try:
-        before = codex_limits()  # inside the slot, so the before/after delta is this call's alone
+        before = codex_limits()  # the delta is this call's alone only if nothing overlapped (see overlapped())
         refusal, warns = preflight(mode, before)
         if refusal:
             fail(refusal, limits=before)
@@ -997,7 +1067,7 @@ def cmd_ask(req):
                              model=model, effort=effort, reason=reason, before=before, warns=warns)
         return result
     finally:
-        h = read_json(lock_path()) or {}
+        h = read_json(slot_path(token)) or {}
         live = [m for m in h.get("tree", []) if alive(m)] if h.get("token") == token else []
         if not live and (result is None or result.get("tree_dead", True)):
             lock_release(token)  # else: members stay recorded; the slot frees only once they are dead
@@ -1016,6 +1086,7 @@ def _ask_locked(mode, cwd, files, diff, user_prompt, version, token, model=MODEL
                   FILES="\n".join(files) or "(none named)", DIFF=diff or "(no diff supplied)",
                   CANARIES=canary_lines or "(none)")
     thread, usage, attempts, final, exit_code, last_ok, tree_dead = None, {}, [], "", None, None, True
+    auth_retry = None
     deadline = PROCESS_START + ASK_DEADLINE_S - TEARDOWN_MARGIN_S
     for attempt in range(MAX_RESUMES + 1):
         remaining = deadline - time.time()
@@ -1024,10 +1095,18 @@ def _ask_locked(mode, cwd, files, diff, user_prompt, version, token, model=MODEL
             break
         ofile, efile = rdir / f"final-{attempt}.txt", rdir / f"events-{attempt}.jsonl"
         text = prompt if attempt == 0 else fill(prompt_file("resume.md"), FILES="\n".join(wanted))
-        started = time.time()
-        rc, dead = run_contained(codex_argv(cwd, "read-only", ofile, thread, model, effort), text, efile,
-                                 rdir / f"stderr-{attempt}.log", remaining, token=token)
-        tree_dead = tree_dead and dead
+        while True:
+            started = time.time()
+            rc, dead = run_contained(codex_argv(cwd, "read-only", ofile, thread, model, effort), text, efile,
+                                     rdir / f"stderr-{attempt}.log", max(1, deadline - time.time()), token=token)
+            tree_dead = tree_dead and dead
+            err = (rdir / f"stderr-{attempt}.log").read_text(encoding="utf-8", errors="replace") if rc else ""
+            if rc and dead and not auth_retry and AUTH_ERROR.search(err) and deadline - time.time() > 30:
+                auth_retry = {"attempt": attempt, "note": "Codex auth error (likely a concurrent token refresh); "
+                              "retried once", "stderr_tail": err[-400:]}
+                time.sleep(2)
+                continue
+            break
         if rc is None:
             attempts.append({"exit": None, "note": f"attempt {attempt} timed out (ask budget)", "tree_dead": dead})
             break
@@ -1045,7 +1124,7 @@ def _ask_locked(mode, cwd, files, diff, user_prompt, version, token, model=MODEL
         final = ofile.read_text(encoding="utf-8", errors="replace")
         last_ok = attempt
         # Resume only when a follow-up can actually help: Codex re-reads a file the CALLER named (already
-        # intake-vetted), as codex-gate fetches only caller-named files. A request outside that list fails
+        # intake-vetted). A request outside that list fails
         # closed back to the driver (computed BLOCKER below), never an instruction to read it.
         # BLOCKERs (unwritten edit, out-of-scope, requester-only context) fail closed without spending a round.
         wanted = need_files(objections(final))
@@ -1066,6 +1145,7 @@ def _ask_locked(mode, cwd, files, diff, user_prompt, version, token, model=MODEL
     last_attempt_ok = last_ok is not None and last_ok == len(attempts) - 1
     satisfied = (last_attempt_ok and bool(final) and all(reads.values()) and not objs) if mode == "gate" else None
     lim_after = codex_limits()
+    shared = overlapped(token)
     result = {
         "ok": bool(final), "mode": mode, "run_id": run_id, "codex_version": version,
         "cwd": str(cwd), "base_rev": base, "file_hashes": hashes, "thread_id": thread,
@@ -1075,9 +1155,10 @@ def _ask_locked(mode, cwd, files, diff, user_prompt, version, token, model=MODEL
         "context_objections": objs, "attempts": attempts, "usage": usage,
         "model": model, "effort": effort, "model_reason": reason,
         "effort_note": "passed per call; --strict-config validated the key; effective value unverified",
-        "quota": {"before": before or {}, "after": lim_after, "delta": quota_delta(before or {}, lim_after)},
+        "quota": quota_record(before or {}, lim_after, shared),
         "warnings": list(warns), "resume": f"codex resume {thread}" if thread else None,
         "final": final, "gate_satisfied": satisfied, "tree_dead": tree_dead,
+        **({"auth_retry": auth_retry} if auth_retry else {}),
     }
     write_json(rdir / "result.json", result)
     return result
@@ -1136,15 +1217,16 @@ def cmd_start(req):
         fail("refused: companions must be committed at HEAD (the review worktree is built from HEAD)", files=untracked)
     deps = [dep_info(repo, d) for d in req.get("deps") or []]
     limits = codex_limits()
-    refusal, warns = preflight("worker", limits)
+    refusal, warns = preflight("worker", limits, running=len(running_workers()))
     if refusal:
         fail(refusal, limits=limits)
     req = {**req, "_model": model, "_effort": effort, "_model_reason": reason, "_deps": deps, "_warnings": warns}
     jid = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-    # Reserve the slot NOW (a lease the supervisor takes over), so no dispatch slips in between.
+    # Reserve the slot NOW (a lease the supervisor takes over), so no other worker takes the last place.
     holder, token = lock_acquire({"kind": "worker", "job": jid}, 0, lease_s=120)
     if holder:
-        out({"ok": False, "error": "busy: a Codex dispatch holds the lock", "holder": holder}, 1)
+        out({"ok": False, "error": f"busy: {holder.get('busy')}; start it again when one finishes "
+             "(or raise max_workers in the config)", "holder": holder}, 1)
     try:
         return _start_reserved(req, repo, jid)
     except BaseException:
@@ -1304,7 +1386,7 @@ def _supervise(jid):
     transition(jid, "pending", supervisor=identity())
     holder, token = lock_acquire({"kind": "worker", "job": jid}, LOCK_WAIT_WORKER_S, takeover_job=jid)
     if holder:
-        transition(jid, "refused", reason="lock busy", holder=holder)
+        transition(jid, "refused", reason=f"no worker slot: {holder.get('busy')}", holder=holder)
         return
     jd, wt, inp = job_dir(jid), Path(job["worktree"]), job["inputs"]
     cancel = jd / "cancel"
@@ -1312,7 +1394,7 @@ def _supervise(jid):
         lock_release(token)
         transition(jid, "cancelled", note="cancelled before Codex started")
         return
-    started, dead, before = time.time(), False, codex_limits()
+    started, dead, before, shared = time.time(), False, codex_limits(), True
     after = {"ok": False, "error": "Codex run raised before the after-read"}
     try:
         prompt = fill(prompt_file("worker.md"), TASK=inp["task"], SCOPE="\n".join(inp["scope"]),
@@ -1321,11 +1403,23 @@ def _supervise(jid):
         (jd / "prompt.md").write_text(prompt, encoding="utf-8")
         version, _ = codex_version()
         transition(jid, "running", codex_version=version, started_ts=started)
-        rc, dead = run_contained(codex_argv(wt, "workspace-write", jd / "final.txt", None,
-                                            job.get("model", MODEL), job.get("effort", EFFORT)), prompt,
-                                 jd / "events.jsonl", jd / "codex-stderr.log", WORKER_CEILING_S,
-                                 token=token, cwd_sweep=wt, cancel_file=cancel)
-        after = codex_limits()  # still inside the slot: no other bridge call can spend quota meanwhile
+        for auth_try in (0, 1):
+            rc, dead = run_contained(codex_argv(wt, "workspace-write", jd / "final.txt", None,
+                                                job.get("model", MODEL), job.get("effort", EFFORT)), prompt,
+                                     jd / "events.jsonl", jd / "codex-stderr.log", WORKER_CEILING_S - (time.time() - started),
+                                     token=token, cwd_sweep=wt, cancel_file=cancel)
+            err = (jd / "codex-stderr.log").read_text(encoding="utf-8", errors="replace") if rc else ""
+            # Retry an auth failure once, and only while the worktree is untouched: a rerun on top of a
+            # partial edit would be a different job.
+            if (auth_try == 0 and rc and dead and not cancel.exists() and AUTH_ERROR.search(err)
+                    and not git(wt, "status", "--porcelain", "--untracked-files=all").stdout.strip()):
+                shutil.copy(jd / "codex-stderr.log", jd / "codex-stderr-auth.log")
+                transition(jid, "running", auth_retry="Codex auth error on an untouched worktree; retried once")
+                time.sleep(2)
+                continue
+            break
+        after = codex_limits()
+        shared = overlapped(token)  # read before the slot is released
     finally:
         if dead:
             lock_release(token)
@@ -1334,7 +1428,7 @@ def _supervise(jid):
         transition(jid, "crashed", reason="Codex process tree still alive after kill; slot kept", quarantine=True)
         return
     wall = round((time.time() - started) / 60, 1)
-    write_json(jd / "quota.json", {"before": before, "after": after, "delta": quota_delta(before, after)})
+    write_json(jd / "quota.json", quota_record(before, after, shared))
     if cancel.exists():
         transition(jid, "cancelled", wallclock_min=wall, quarantine=True,
                    note="cancelled mid-run: worktree is partial, do not review")
@@ -1689,7 +1783,7 @@ def cmd_status(jid=None):
                      "review_started": st.get("review_started"),
                      "owner": job.get("owner"), "updated": st.get("updated"),
                      "tier": (job.get("inputs") or {}).get("tier")})
-    return {"ok": True, "lock": lock_holder(), "jobs": rows}
+    return {"ok": True, "slots": lock_holder(), "max_workers": MAX_WORKERS, "jobs": rows}
 
 
 def cmd_result(jid):
@@ -2103,7 +2197,7 @@ def main(argv):
     elif cmd == "burn":
         out(cmd_burn(stdin_json()))
     elif cmd == "lock":
-        out({"ok": True, "holder": lock_holder()})
+        out({"ok": True, "slots": lock_holder()})
     elif cmd == "usage":
         out(cmd_usage())
     elif cmd == "selftest":

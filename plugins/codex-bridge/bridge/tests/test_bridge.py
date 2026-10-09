@@ -147,19 +147,20 @@ class ReviewFindings(Base):
         n = self.b.normalize("Ran 3 tests in 0.001s\n\nOK (skipped=3)", 0)
         self.assertEqual((n["passed"], n["skipped"]), (0, 3))
 
-    def test_reclaim_never_removes_a_live_lock(self):  # finding 3
-        self.home.mkdir(parents=True, exist_ok=True)
-        dead = {"identity": "999999:never", "owner": {}}
-        self.b.write_json(self.b.lock_path(), dead)
-        live = {"identity": self.b.identity(), "owner": {"k": "live"}}
-        self.b.write_json(self.b.lock_path(), live)  # someone re-took it after we judged it dead
-        self.b._reclaim(dead)
-        self.assertEqual(self.b.read_json(self.b.lock_path()), live)
+    def test_reclaim_never_removes_a_live_slot(self):  # finding 3
+        self.b.slots_dir().mkdir(parents=True, exist_ok=True)
+        path = self.b.slot_path("t0")
+        dead = {"holder": "999999:never", "owner": {}}
+        self.b.write_json(path, dead)
+        live = {"holder": self.b.identity(), "owner": {"k": "live"}}
+        self.b.write_json(path, live)  # rewritten after we judged it dead
+        self.b._reclaim(path, dead)
+        self.assertEqual(self.b.read_json(path), live)
 
-    def test_lock_file_is_never_half_written(self):  # finding 3a
+    def test_slot_file_is_never_half_written(self):  # finding 3a
         holder, tok = self.b.lock_acquire({"t": 1}, 0)
         self.assertIsNone(holder)
-        self.assertIsNotNone(self.b.read_json(self.b.lock_path()))  # full JSON from the first instant (os.link)
+        self.assertIsNotNone(self.b.read_json(self.b.slot_path(tok)))  # atomic write: full JSON from the first instant
         self.b.lock_release(tok)
 
     def test_symlink_and_private_key_canaries_refused(self):  # gate finding 4
@@ -233,6 +234,23 @@ class Round2(Base):
             bystander.kill()
             bystander.wait()
 
+    def test_worker_auth_error_on_untouched_worktree_is_retried(self):
+        jid = self.inproc(verify="echo '==== 3 passed in 0.10s ===='", REPLY=CLAIM_OK,
+                          AUTH_FAIL_ONCE=str(Path(self.tmp.name) / "auth-marker"))
+        self.b.cmd_supervise(jid)
+        st = self.b.read_json(self.b.job_dir(jid) / "state.json")
+        self.assertIn("retried once", st.get("auth_retry", ""))
+        self.assertEqual(st["state"], "receipted")
+        self.assertTrue((self.b.job_dir(jid) / "codex-stderr-auth.log").exists())
+
+    def test_worker_auth_error_after_an_edit_is_not_retried(self):
+        jid = self.inproc(verify="echo '==== 3 passed in 0.10s ===='", REPLY=CLAIM_OK, AUTH_FAIL_LATE="1",
+                          AUTH_FAIL_ONCE=str(Path(self.tmp.name) / "auth-marker"), EDIT="app.py=x = 1\n")
+        self.b.cmd_supervise(jid)
+        st = self.b.read_json(self.b.job_dir(jid) / "state.json")
+        self.assertNotIn("auth_retry", st)
+        self.assertNotEqual(st.get("outcome"), "clean")
+
     def test_second_supervisor_is_a_noop(self):
         jid = self.inproc(verify="echo '==== 3 passed in 0.10s ===='", REPLY=CLAIM_OK)
         self.b.cmd_supervise(jid)
@@ -266,26 +284,77 @@ class Round2(Base):
 
 
 class Lock(Base):
-    def test_second_holder_blocked_and_stale_reclaimed(self):
-        holder, tok = self.b.lock_acquire({"t": 1}, 0)
-        self.assertIsNone(holder)
-        self.assertIsNotNone(self.b.lock_acquire({"t": 2}, 0)[0])  # live holder blocks
-        self.b.lock_release(tok)
-        self.b.write_json(self.b.lock_path(), {"holder": "999999:never", "owner": {}, "tree": []})
-        self.assertTrue(self.b.lock_holder()["stale"])
-        holder, tok = self.b.lock_acquire({"t": 3}, 0)
-        self.assertIsNone(holder)
-        self.b.lock_release(tok)
+    """0.3.0: one slot per dispatch. Asks/gates never wait; workers are capped by max_workers."""
+    W = {"kind": "worker"}
 
-    def test_orphan_tree_holds_slot_until_killed(self):  # gate finding 1
+    def worker(self, job, **kw):
+        return self.b.lock_acquire({**self.W, "job": job}, 0, **kw)
+
+    def test_asks_and_gates_run_side_by_side(self):
+        a = self.b.lock_acquire({"kind": "ask"}, 0)
+        g = self.b.lock_acquire({"kind": "gate"}, 0)
+        w = self.worker("j1")
+        self.assertEqual([a[0], g[0], w[0]], [None, None, None])
+        self.assertEqual(len(self.b.lock_holder()), 3)
+        for _, tok in (a, g, w):
+            self.b.lock_release(tok)
+        self.assertEqual(self.b.lock_holder(), [])
+
+    def test_workers_capped_by_max_workers_and_asks_never(self):
+        self.b.MAX_WORKERS = 2
+        toks = [self.worker(f"j{i}")[1] for i in range(2)]
+        busy, tok = self.worker("j3")
+        self.assertIsNone(tok)
+        self.assertIn("max_workers is 2", busy["busy"])
+        self.assertEqual(len(busy["running"]), 2)
+        ask = self.b.lock_acquire({"kind": "ask"}, 0)  # the cap is for workers only
+        self.assertIsNone(ask[0])
+        self.b.lock_release(toks[0])
+        self.assertIsNone(self.worker("j3")[0])  # a freed place is taken at once
+
+    def test_racing_processes_never_exceed_the_cap(self):
+        (self.home / "config.json").write_text(json.dumps({"max_workers": 3}))
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import bridge; "
+                "busy, tok = bridge.lock_acquire({'kind': 'worker', 'job': sys.argv[2]}, 0); "
+                "print('got' if tok else 'busy', flush=True); time.sleep(3 if tok else 0)")
+        env = {**os.environ, "CODEX_BRIDGE_HOME": str(self.home)}
+        procs = [subprocess.Popen([sys.executable, "-c", code, str(HERE.parent), f"j{i}"], env=env,
+                                  stdout=subprocess.PIPE, text=True) for i in range(8)]
+        results = [pr.communicate(timeout=60)[0].strip() for pr in procs]
+        self.assertEqual(results.count("got"), 3, results)
+
+    def test_zero_means_no_cap(self):
+        self.b.MAX_WORKERS = 0
+        self.assertTrue(all(self.worker(f"j{i}")[0] is None for i in range(5)))
+
+    def test_supervisor_inherits_its_reservation_even_at_the_cap(self):
+        self.b.MAX_WORKERS = 1
+        _, res = self.worker("j1", lease_s=60)  # `start` reserves the only place
+        self.assertIsNotNone(self.worker("j2")[0])  # nobody else gets it
+        busy, tok = self.b.lock_acquire({**self.W, "job": "j1"}, 0, takeover_job="j1")
+        self.assertIsNone(busy)
+        self.assertFalse(self.b.slot_path(res).exists())  # the reservation became the supervisor's slot
+        self.assertEqual(len(self.b.running_workers()), 1)
+
+    def test_dead_worker_slot_frees_its_place(self):
+        self.b.MAX_WORKERS = 1
+        self.b.slots_dir().mkdir(parents=True, exist_ok=True)
+        self.b.write_json(self.b.slot_path("dead"), {"holder": "999999:never", "owner": {**self.W, "job": "x"}, "tree": []})
+        self.assertTrue(self.b.lock_holder()[0]["stale"])
+        busy, tok = self.worker("j1")
+        self.assertIsNone(busy)
+        self.assertFalse(self.b.slot_path("dead").exists())
+
+    def test_orphan_tree_holds_its_place_until_killed(self):  # gate finding 1
+        self.b.MAX_WORKERS = 1
         child = subprocess.Popen(["sleep", "300"], start_new_session=True)
         try:
-            self.home.mkdir(parents=True, exist_ok=True)
-            orphan = {"holder": "999999:dead supervisor", "owner": {"kind": "worker"}, "tree": [self.b.identity(child.pid)],
+            self.b.slots_dir().mkdir(parents=True, exist_ok=True)
+            orphan = {"holder": "999999:dead supervisor", "owner": {**self.W, "job": "old"}, "tree": [self.b.identity(child.pid)],
                       "machine": self.b.machine(), "token": "t0"}
-            self.b.write_json(self.b.lock_path(), orphan)
-            self.assertTrue(self.b.lock_held(orphan))  # supervisor dead, Codex alive: still held
-            holder, tok = self.b.lock_acquire({"t": "next"}, 0)  # reclaim kills the orphan, then takes the slot
+            self.b.write_json(self.b.slot_path("t0"), orphan)
+            self.assertTrue(self.b.lock_held(orphan))  # supervisor dead, Codex alive: still counts
+            holder, tok = self.worker("next")  # reclaim kills the orphan, then takes the place
             self.assertIsNone(holder)
             child.wait(timeout=10)
             self.b.lock_release(tok)
@@ -293,12 +362,47 @@ class Lock(Base):
             if child.poll() is None:
                 child.kill()
 
-    def test_lease_blocks_until_released(self):  # gate finding 10
-        holder, tok = self.b.lock_acquire({"kind": "old-agent"}, 0, lease_s=60)
+    def test_lease_holds_a_place_until_released(self):  # gate finding 10
+        self.b.MAX_WORKERS = 1
+        holder, tok = self.worker("j1", lease_s=60)
         self.assertIsNone(holder)
-        self.assertIsNotNone(self.b.lock_acquire({"t": 1}, 0)[0])
+        self.assertIsNotNone(self.worker("j2")[0])
         self.b.lock_release(tok)
-        self.assertIsNone(self.b.lock_holder())
+        self.assertEqual(self.b.lock_holder(), [])
+
+    def test_overlap_is_detected_both_ways(self):
+        _, a = self.b.lock_acquire({"kind": "ask"}, 0)
+        self.assertFalse(self.b.overlapped(a))  # alone so far
+        _, b = self.b.lock_acquire({"kind": "gate"}, 0)  # started during a
+        self.assertTrue(self.b.overlapped(a))
+        self.assertTrue(self.b.overlapped(b))  # a was running when b started
+        self.b.lock_release(a)
+        self.b.lock_release(b)
+        _, c = self.b.lock_acquire({"kind": "ask"}, 0)
+        self.assertFalse(self.b.overlapped(c))
+        self.b.lock_release(c)
+
+    def test_shared_quota_never_feeds_the_estimate(self):
+        lim = lambda u: {"ok": True, "windows": {"primary": {"used": u}}}  # noqa: E731
+        self.assertEqual(self.b.quota_record(lim(10), lim(14), False)["delta"], {"primary": 4})
+        rec = self.b.quota_record(lim(10), lim(14), True)
+        self.assertIsNone(rec["delta"])
+        self.assertEqual((rec["shared_delta"], rec["overlapping"]), ({"primary": 4}, True))
+
+    def test_preflight_counts_running_workers(self):
+        lim = self.b.codex_limits()  # primary 10% used
+        self.b.estimate = lambda lane, window: 10.0 if window == "primary" else 0.0
+        self.assertIsNone(self.b.preflight("worker", lim, running=8)[0])  # 10 + 10 x 9 = 100: fits
+        refusal = self.b.preflight("worker", lim, running=9)[0]
+        self.assertIn("plus 9 running", refusal)
+
+    def test_max_workers_config_validated(self):
+        for bad in (-1, "3", True, 1.5):
+            (self.home / "config.json").write_text(json.dumps({"max_workers": bad}))
+            r = subprocess.run([sys.executable, str(HERE.parent / "bridge.py"), "config"], capture_output=True, text=True,
+                               env={**os.environ, "CODEX_BRIDGE_HOME": str(self.home)})
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("max_workers", r.stdout)
 
     def test_pid_reuse_guard(self):
         self.assertTrue(self.b.alive(self.b.identity()))
@@ -339,11 +443,27 @@ class Gate(Base):
         self.assertFalse(r["gate_satisfied"])
         self.assertFalse(r["ok"])
 
-    def test_lock_busy_refuses(self):
-        self.home.mkdir(parents=True, exist_ok=True)
-        self.b.write_json(self.b.lock_path(), {"holder": self.b.identity(), "owner": {"kind": "worker"}, "tree": []})
-        self.b.LOCK_WAIT_ASK_S = 0
-        self.refused(self.ask, "x")
+    def test_running_worker_never_blocks_a_gate(self):  # 0.3.0: was "lock busy refuses"
+        self.b.slots_dir().mkdir(parents=True, exist_ok=True)
+        self.b.write_json(self.b.slot_path("w"), {"holder": self.b.identity(), "owner": {"kind": "worker"}, "tree": []})
+        r = self.ask("CONTEXT-OBJECTIONS\nnone\nEND-CONTEXT-OBJECTIONS\nREAD-RECEIPT\n{{ECHO_CANARIES}}\nEND-READ-RECEIPT\n")
+        self.assertTrue(r["gate_satisfied"], r)
+        self.assertTrue(r["quota"]["overlapping"])  # a worker ran alongside: the delta is shared
+        self.assertIsNone(r["quota"]["delta"])
+
+    def test_auth_error_is_retried_once(self):
+        os.environ["FAKE_CODEX_AUTH_FAIL_ONCE"] = str(Path(self.tmp.name) / "auth-marker")
+        r = self.ask("CONTEXT-OBJECTIONS\nnone\nEND-CONTEXT-OBJECTIONS\nREAD-RECEIPT\n{{ECHO_CANARIES}}\nEND-READ-RECEIPT\n")
+        self.assertTrue(r["gate_satisfied"], r)
+        self.assertIn("auth error", r["auth_retry"]["note"])
+        self.assertEqual(len(r["attempts"]), 1)
+
+    def test_persistent_auth_error_fails_closed_after_one_retry(self):
+        os.environ["FAKE_CODEX_AUTH_FAIL_ALWAYS"] = "1"
+        r = self.ask("anything")
+        self.assertFalse(r["ok"])
+        self.assertIn("auth_retry", r)  # retried exactly once, then failed closed: never a loop
+        self.assertEqual(len(r["attempts"]), 1)
 
 
 class Round3(Base):
@@ -587,7 +707,7 @@ class CodeReview(Base):
                 self.start(REPLY=CLAIM_OK)
         finally:
             self.b.git = real
-        self.assertIsNone(self.b.lock_holder())
+        self.assertEqual(self.b.lock_holder(), [])
         self.assertEqual(list((self.home / "jobs").iterdir()) if (self.home / "jobs").exists() else [], [])
 
     def test_pytest_quiet_failure_summary_parses(self):  # CR-10
@@ -640,7 +760,7 @@ class Worker(Base):
         r = self.receipt(jid)
         self.assertEqual(r["outcome"], "clean", r)
         self.assertEqual(r["computed"]["changed"], ["app.py"])
-        self.assertIsNone(self.b.lock_holder())  # released after the tree died
+        self.assertEqual(self.b.lock_holder(), [])  # released after the tree died
 
     def test_verifier_modified(self):
         jid = self.start(verify="echo '==== 3 passed in 0.10s ===='", REPLY=CLAIM_OK,
@@ -727,7 +847,7 @@ class Worker(Base):
         st = self.b.read_json(self.b.job_dir(jid) / "state.json")
         self.assertEqual(st["state"], "timeout")
         self.assertTrue(st["quarantine"])
-        self.assertIsNone(self.b.lock_holder())
+        self.assertEqual(self.b.lock_holder(), [])
         after = subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True).stdout.split()
         self.assertFalse(set(after) - set(before), "setsid grandchild survived the kill")
 
@@ -747,7 +867,7 @@ class Worker(Base):
         self.b.cmd_supervise(jid)
         after = set(subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True).stdout.split())
         self.assertFalse(after - before, "child left by a normally-exiting Codex survived")
-        self.assertIsNone(self.b.lock_holder())
+        self.assertEqual(self.b.lock_holder(), [])
 
     def test_denied_path_written_inside_broad_scope(self):  # finding 2
         jid = self.inproc(verify="echo '==== 3 passed in 0.10s ===='", REPLY=CLAIM_OK)
@@ -1174,7 +1294,7 @@ class V011(Base):
         self.assertTrue(self.b.cmd_cancel(jid)["cancelled"])   # waits for the supervisor's real outcome
         self.assertEqual(self.b.state_of(jid), "cancelled")
         self.assertLess(time.time() - t, 25)
-        self.assertIsNone(self.b.lock_holder())
+        self.assertEqual(self.b.lock_holder(), [])
         with self.assertRaises(SystemExit):
             self.b.cmd_cancel(jid)                  # nothing left to cancel
 

@@ -169,7 +169,7 @@ describe('codex-bridge', () => {
   test('a review without VERDICT-JSON is re-run once, not recorded', async ($, on) => {
     const env = engine(on, { status: { ok: true, jobs: [] }, 'review-retry': { ok: true, retried: true }, result: { ok: true, state: { outcome: 'clean' }, receipt: { computed: {} } } })
     await $.session.start(START)
-    env.store.reviewing = { 'rev-1': { job: 'j-clean01', kind: 'review', snapshot: 's1', gen: 1 } }
+    env.store.reviewing = { 'rev-1': { job: 'j-clean01', kind: 'review', snapshot: 's1', gen: 1, model: 'claude-sonnet-5-5' } }
     await $.turn.complete({ reason: 'answer', answer: 'Recommend accept. (no block)', durationMs: 1, agentId: 'rev-1', usage: { input_tokens: 5, output_tokens: 5 } } as any)
     expect(env.calls.find(c => c.cmd === 'review-retry')!.args).toEqual(['j-clean01', '1'])
     expect(env.calls.some(c => c.cmd === 'verdict')).toBe(false)
@@ -180,6 +180,7 @@ describe('codex-bridge', () => {
     const b = env.calls.find(c => c.cmd === 'burn')!.stdin
     expect(b.review_verdict).toBe('retry (no VERDICT-JSON)')
     expect(b.reviewer_tokens).toBe(10)
+    expect(b.reviewer_model).toBe('claude-sonnet-5-5') // the model core resolved at spawn, not the session's
   })
 
   test('a second missing VERDICT-JSON is recorded; the correction names the real cause, not a changed worktree', async ($, on) => {
@@ -260,11 +261,12 @@ describe('codex-bridge', () => {
       result: { ok: true, state: { outcome: 'clean' }, receipt: { computed: {} } },
     })
     await $.session.start(START)
-    env.store.reviewing = { 'rev-1': { job: 'j-clean01', kind: 'review', snapshot: 's1', gen: 1 } }
+    env.store.reviewing = { 'rev-1': { job: 'j-clean01', kind: 'review', snapshot: 's1', gen: 1, model: 'claude-opus-5-5' } }
     await $.turn.complete({ reason: 'answer', answer: 'VERDICT-JSON\n{"verdict": "accept", "snapshot": "s1"}\nEND-VERDICT-JSON', durationMs: 1, agentId: 'rev-1', usage: { input_tokens: 3, output_tokens: 4 } } as any)
     expect(env.prompts.length).toBe(0)
     expect(env.calls.some(c => c.cmd === 'mark')).toBe(false)
     expect(env.calls.find(c => c.cmd === 'burn')!.stdin.reviewer_tokens).toBe(7)
+    expect(env.calls.find(c => c.cmd === 'burn')!.stdin.reviewer_model).toBe('claude-opus-5-5')
   })
 
   test('a reporter that loses the notify claim after a lease expiry neither marks nor burns', async ($, on) => {
@@ -480,7 +482,7 @@ describe('codex-bridge', () => {
 
   test('/codex-bridge status, result, cancel and usage', async ($, on) => {
     const env = engine(on, {
-      status: { ok: true, lock: null, jobs: [
+      status: { ok: true, slots: [{ owner: { kind: 'worker', job: 'j-live' } }, { owner: { kind: 'gate' } }, { owner: { kind: 'worker' }, stale: true }], max_workers: 3, jobs: [
         { id: 'j-live', local: true, state: 'running', tier: 'R1', task: 'build x', worktree_retained: true },
         { id: 'j-old', local: true, state: 'discarded', tier: 'R0', task: 'old', worktree_retained: false },
       ] },
@@ -490,7 +492,7 @@ describe('codex-bridge', () => {
     })
     await $.session.start(START)
     const st: any = await $.command.run({ command: 'codex-bridge', args: 'status' } as any)
-    expect(st.text).toContain('codex slot: free')
+    expect(st.text).toContain('codex runs in flight: 2 (1 worker job, max 3; asks/gates uncapped)')
     expect(st.text).toContain('j-live · running · R1 · build x')
     expect(st.text).not.toContain('j-old')
     const res: any = await $.command.run({ command: 'codex-bridge', args: 'result j-live' } as any)
@@ -504,7 +506,7 @@ describe('codex-bridge', () => {
     expect(two.text).toContain('exactly one job id')
     expect(env.calls.filter(c => c.cmd === 'cancel').length).toBe(1)
     const upper: any = await $.command.run({ command: 'codex-bridge', args: 'STATUS' } as any)
-    expect(upper.text).toContain('codex slot: free')
+    expect(upper.text).toContain('codex runs in flight: 2')
     const help: any = await $.command.run({ command: 'codex-bridge', args: '' } as any)
     expect(help.text).toContain('Usage: /codex-bridge')
   })
@@ -525,5 +527,19 @@ describe('codex-bridge', () => {
     const before = env.calls.filter(c => c.cmd === 'status').length
     await env.clock.advance(61_000) // idle watcher polls once a minute
     expect(env.calls.filter(c => c.cmd === 'status').length).toBeGreaterThan(before)
+  })
+
+  test('an overlapped gate shows its quota as shared, and the burn row carries no per-call delta', async ($, on) => {
+    const env = engine(on, {
+      status: { ok: true, jobs: [] },
+      ask: { ok: true, mode: 'gate', codex_version: 'v', cwd: '/r', thread_id: 't', read_evidence: {}, context_objections: [], attempts: [],
+        final: 'F', gate_satisfied: true, quota: { delta: null, shared_delta: { primary: 6 }, overlapping: true } },
+    })
+    await $.session.start(START)
+    const r: any = await $.tool.call({ tool: 'mcp__codex-bridge__codex', mode: 'gate', prompt: 'p', diff: '+x', cwd: '/r' } as any)
+    expect(r.result).toContain('shared: other Codex runs overlapped this one (5h +6 pts across all of them)')
+    const burn = env.calls.find(c => c.cmd === 'burn')!
+    expect(burn.stdin.quota_delta).toBe(null)
+    expect(burn.stdin.quota_overlapping).toBe(true)
   })
 })

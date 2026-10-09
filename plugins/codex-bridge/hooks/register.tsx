@@ -4,7 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { AskRow, JobRow, LimitsRow } from '../types'
 
 // codex-bridge: Codex as a direct tool + supervised worker jobs. The logic lives in bridge/bridge.py
-// (stdlib Python, unit-tested); this module is the thin layer: tools, band, reviewer, lock check.
+// (stdlib Python, unit-tested); this module is the thin layer: tools, command, band, reviewer.
 // Design notes: docs/design.md.
 
 const jobsAtom = atom({ plugin: 'codex-bridge', key: 'jobs' } as const, [])
@@ -92,9 +92,11 @@ function minutes(since: string | number) {
 }
 
 function quotaText(q: Bridge | undefined) {
+  const fmt = (d: Record<string, number>) => Object.entries(d).map(([w, v]) => `${w === 'primary' ? '5h' : w === 'secondary' ? 'wk' : w} +${v} pts`).join(', ')
+  if (q?.overlapping) return `shared: other Codex runs overlapped this one (${q.shared_delta ? `${fmt(q.shared_delta)} across all of them` : 'limits read failed'})`
   const d = q?.delta
   if (!d) return 'unknown (limits read failed before or after)'
-  return Object.entries(d).map(([w, v]) => `${w === 'primary' ? '5h' : w === 'secondary' ? 'wk' : w} +${v} pts`).join(', ')
+  return fmt(d)
 }
 
 async function refreshLimits($: EngineInterface) {
@@ -145,7 +147,8 @@ async function spawnReviewer($: EngineInterface, job: string, kind: 'review' | '
   const r = await $.agent.spawn({ subagentType: agent, description: `codex-bridge ${kind} ${job}`, prompt: text })
   if (r.agentId) {
     const map = ((await $.store.get(REVIEW_MAP)) as Record<string, unknown>) ?? {}
-    await $.store.set(REVIEW_MAP, { ...map, [r.agentId]: { job, kind, snapshot: pk.snapshot, gen: pk.review_gen, at: Date.now() } })
+    // r.model is the model core resolved for this reviewer: logged per review, so the tier's model is proven, not assumed.
+    await $.store.set(REVIEW_MAP, { ...map, [r.agentId]: { job, kind, snapshot: pk.snapshot, gen: pk.review_gen, model: r.model, at: Date.now() } })
   }
   return r
 }
@@ -274,11 +277,11 @@ function modelFields(res: Bridge) {
   const c = res.receipt?.computed ?? {}
   const m = res.model ?? {}
   return { model: c.model ?? m.model ?? null, effort: c.effort ?? m.effort ?? null, model_reason: c.model_reason ?? m.model_reason ?? null,
-    quota_delta: c.quota?.delta ?? res.quota?.delta ?? null }
+    quota_delta: c.quota?.delta ?? res.quota?.delta ?? null, quota_overlapping: !!(c.quota?.overlapping ?? res.quota?.overlapping) }
 }
 
 // Record the reviewer's verdict; show and log what was RECORDED, correcting the hand-back when it differs.
-async function recordVerdict($: EngineInterface, entry: { job: string; kind: string; gen?: number }, e: any) {
+async function recordVerdict($: EngineInterface, entry: { job: string; kind: string; gen?: number; model?: string }, e: any) {
   const parsed = verdictOf(e.answer)
   const u = e.usage as Record<string, number> | undefined
   const reviewerTokens = u ? (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) : null
@@ -304,7 +307,7 @@ async function recordVerdict($: EngineInterface, entry: { job: string; kind: str
     $.ui.toast(`Codex job ${entry.job.slice(-6)}: reviewer gave no verdict block; re-running the review once`)
     await burn($, {
       lane: 'codex-bridge-worker', job: entry.job, review_verdict: 'retry (no VERDICT-JSON)', reviewer_claimed: 'unparseable',
-      reviewer_usage: u ?? null, reviewer_tokens: reviewerTokens, total_claude_tokens: null, claude_tokens_note: TOTAL_NOTE,
+      reviewer_model: entry.model ?? null, reviewer_usage: u ?? null, reviewer_tokens: reviewerTokens, total_claude_tokens: null, claude_tokens_note: TOTAL_NOTE,
     })
     return
   }
@@ -338,14 +341,14 @@ async function recordVerdict($: EngineInterface, entry: { job: string; kind: str
     // A superseded mark means a replacement review owns the job: never claim its notification.
     if (m.ok && m.marked) await bridge($, ['claim', entry.job, 'notify'])
   }
-  $.ui.toast(`Codex job ${entry.job.slice(-6)} ${entry.kind}: ${shown}${rec.stale ? ' (STALE snapshot)' : ''}`)
+  $.ui.toast(`Codex job ${entry.job.slice(-6)} ${entry.kind}: ${shown}${rec.stale ? ' (STALE snapshot)' : ''}${entry.model ? ` · ${entry.model}` : ''}`)
   await burn($, {
     lane: entry.kind === 'review' ? 'codex-bridge-worker' : 'codex-bridge-diagnose', job: entry.job,
     ...(entry.kind === 'review' ? modelFields(res) : {}),
     outcome: res.state?.outcome ?? null, review_verdict: shown, reviewer_claimed: v.verdict,
     codex_tokens: res.receipt?.computed?.codex_tokens ?? null, codex_wallclock_min: res.state?.wallclock_min ?? null,
     diff_lines: res.receipt?.computed?.diff_lines ?? null, files_changed: res.receipt?.computed?.changed?.length ?? null,
-    reviewer_usage: u ?? null, reviewer_tokens: reviewerTokens, total_claude_tokens: null, claude_tokens_note: TOTAL_NOTE,
+    reviewer_model: entry.model ?? null, reviewer_usage: u ?? null, reviewer_tokens: reviewerTokens, total_claude_tokens: null, claude_tokens_note: TOTAL_NOTE,
   })
 }
 
@@ -450,13 +453,19 @@ async function commandSetup($: EngineInterface) {
   return lines.join('\n')
 }
 
+function codexRuns(s: Bridge) {
+  const live = ((s.slots ?? []) as Bridge[]).filter(h => !h.stale)
+  const workers = live.filter(h => h.owner?.kind === 'worker').length
+  return `codex runs in flight: ${live.length} (${workers} worker job${workers === 1 ? '' : 's'}, max ${s.max_workers ? s.max_workers : 'unlimited'}; asks/gates uncapped)`
+}
+
 async function commandStatus($: EngineInterface) {
   const [s, u] = await Promise.all([bridge($, ['status']), bridge($, ['usage'], undefined, 30_000)])
   if (!s.ok) return `codex-bridge: status unavailable - ${s.error}`
   const rows = (s.jobs as Bridge[]).filter(j => ACTIVE.has(j.state) || j.worktree_retained)
   return [
     `codex limits: ${limitsText(u)}`,
-    `codex slot: ${s.lock ? `held by ${JSON.stringify(s.lock)}` : 'free'}`,
+    codexRuns(s),
     rows.length ? `jobs (${rows.length} active or with a worktree, of ${s.jobs.length}):` : `jobs: none active (${s.jobs.length} on record)`,
     ...rows.map(j => `  ${j.id} · ${j.state}${j.outcome ? ` (${j.outcome})` : ''} · ${j.tier ?? '?'}${j.local ? '' : ` · on ${j.machine}`} · ${j.task}`),
   ].join('\n')
@@ -478,12 +487,12 @@ export const register: Register = on => {
     await $.agent.register({ name: 'reviewer-sonnet', description: 'codex-bridge internal R1 reviewer. Never use directly.', prompt: reviewerPrompt, tools: ['Read', 'Grep', 'Glob'], model: 'sonnet' })
     await $.tool.register({
       name: 'codex',
-      description: 'Ask Codex (read-only) directly, with no wrapper subagent. The bridge picks the model from the stakes: gate needs `trigger` (which gate rule fired); you may only raise. mode "gate" is the Codex critique gate: give the literal diff and the named files; the reply carries a grounding receipt, Codex\'s objections and findings verbatim, gate_satisfied, the model used and the Codex quota it cost. Refuses when a Codex limit is already hit (with the reset time). Secrets (.env, keys, .git internals) can never be named. One Codex dispatch runs at a time; a call waits up to 2 min for a running job, then refuses. Slot coverage: bridge runs on this machine never overlap each other. Codex used by hand, subagents running Codex themselves, and other machines are NOT coordinated.',
+      description: 'Ask Codex (read-only) directly, with no wrapper subagent. The bridge picks the model from the stakes: gate needs `trigger` (which gate rule fired); you may only raise. mode "gate" is the Codex critique gate: give the literal diff and the named files; the reply carries a grounding receipt, Codex\'s objections and findings verbatim, gate_satisfied, the model used and the Codex quota it cost. Refuses when a Codex limit is already hit (with the reset time). Secrets (.env, keys, .git internals) can never be named. Never waits for other Codex runs: asks, gates and worker jobs run side by side (one Codex login serves several runs at once).',
       inputSchema: SCHEMA_ASK,
       isDeferred: false,
     })
-    await $.tool.register({ name: 'codex_start', description: `Start a long Codex worker job in an isolated worktree. Needs a passing \`bridge.py selftest\` on this machine (without it, build directly in Claude). Returns a job id at once; the job survives the session, is verified in a sandbox, and a clean job gets an automatic read-only review by tier: by default R0 none (receipt + re-run are the check; Sonnet if it changed a verifier), R1 Sonnet, R2 Opus (configurable). Never merges or commits. Scope may not touch protected files (${PROTECTED}): the worker proposes those as a suggested patch instead. Refused when Codex usage is too high for a worker (shows the reset time). Do not start processes inside the worktree of a running job: detached ones are killed at cleanup.`, inputSchema: SCHEMA_START, isDeferred: false })
-    await $.tool.register({ name: 'codex_status', description: 'List codex-bridge jobs and the Codex lock holder.', inputSchema: { type: 'object', properties: {} } })
+    await $.tool.register({ name: 'codex_start', description: `Start a long Codex worker job in an isolated worktree. Needs a passing \`bridge.py selftest\` on this machine (without it, build directly in Claude). Returns a job id at once; the job survives the session, is verified in a sandbox, and a clean job gets an automatic read-only review by tier: by default R0 none (receipt + re-run are the check; Sonnet if it changed a verifier), R1 Sonnet, R2 Opus (configurable). Never merges or commits. Scope may not touch protected files (${PROTECTED}): the worker proposes those as a suggested patch instead. Refused when Codex usage is too high for a worker (counting the workers already running; shows the reset time) or when max_workers worker jobs (config, default 3) are already running on this machine. Do not start processes inside the worktree of a running job: detached ones are killed at cleanup.`, inputSchema: SCHEMA_START, isDeferred: false })
+    await $.tool.register({ name: 'codex_status', description: 'List codex-bridge jobs, the Codex runs in flight on this machine, and Codex usage limits.', inputSchema: { type: 'object', properties: {} } })
     await $.tool.register({ name: 'codex_result', description: 'Receipt (computed vs claimed) and review verdict for a codex-bridge job.', inputSchema: SCHEMA_JOB })
     await $.tool.register({ name: 'codex_discard', description: "Remove a finished job's worktree (refuses while running). Use after merging or rejecting.", inputSchema: SCHEMA_JOB })
     await $.tool.register({ name: 'codex_cancel', description: 'Stop a pending or running codex-bridge worker job. Its worktree is kept (quarantined).', inputSchema: SCHEMA_JOB })
@@ -511,7 +520,7 @@ export const register: Register = on => {
       await burn($, {
         lane: `codex-bridge-${input.mode}`, outcome: r.mode === 'gate' ? `gate_satisfied=${r.gate_satisfied}` : (r.ok ? 'answered' : 'failed'),
         model: r.model ?? null, effort: r.effort ?? null, model_reason: r.model_reason ?? null, trigger: input.trigger ?? null,
-        quota_delta: r.quota?.delta ?? null,
+        quota_delta: r.quota?.delta ?? null, quota_overlapping: !!r.quota?.overlapping,
         codex_tokens: r.usage ?? null, attempts: r.attempts?.length ?? 0,
         result_chars: text.length, total_claude_tokens: null, claude_tokens_note: TOTAL_NOTE,
       })
@@ -519,26 +528,26 @@ export const register: Register = on => {
     } finally {
       await update($, askAtom, () => null)
     }
-  }).catch(() => ({ result: 'codex-bridge: internal error in codex; nothing was dispatched or the result is unknown. Check codex_status; the codex-gate agent is the gate fallback; for worker jobs, build directly in Claude.' }))
+  }).catch(() => ({ result: 'codex-bridge: internal error in codex; nothing was dispatched or the result is unknown. Check codex_status (or /codex-bridge status) before retrying.' }))
 
   on('tool.call', { tool: 'mcp__codex-bridge__codex_start' }, async ($, e) => {
     const r = await bridge($, ['start'], { ...pick(e, START_KEYS), protocol: PROTOCOL, owner: SESSION })
     await refresh($)
     void refreshLimits($)
     return { result: r.ok ? `Started Codex job ${r.job_id} (worktree ${r.worktree}) on ${r.model}/${r.effort} (${r.model_reason}).${r.warnings?.length ? ` Warnings: ${r.warnings.join('; ')}.` : ''} It runs detached; the band tracks it, and you'll get the verdict or failure report when it lands.` : `Refused: ${r.error}${r.holder ? ` (holder ${JSON.stringify(r.holder)})` : ''}${r.denylisted?.length ? ` denylisted: ${r.denylisted}` : ''}${r.bad?.length ? ` bad: ${r.bad}` : ''}` }
-  }).catch(() => ({ result: 'codex-bridge: internal error in codex_start; nothing was dispatched or the result is unknown. Check codex_status; the codex-gate agent is the gate fallback; for worker jobs, build directly in Claude.' }))
+  }).catch(() => ({ result: 'codex-bridge: internal error in codex_start; nothing was dispatched or the result is unknown. Check codex_status (or /codex-bridge status) before retrying.' }))
 
   on('tool.call', { tool: 'mcp__codex-bridge__codex_status' }, async $ => ({ result: JSON.stringify({ ...(await bridge($, ['status'])), codex_limits: await bridge($, ['usage'], undefined, 30_000) }, null, 2) })).catch(() => ({ result: 'codex-bridge: status unavailable (bridge error)' }))
 
   on('tool.call', { tool: 'mcp__codex-bridge__codex_result' }, async ($, e) => {
     return { result: JSON.stringify(await bridge($, ['result', String(pick(e, ['job_id']).job_id)]), null, 2) }
-  }).catch(() => ({ result: 'codex-bridge: internal error in codex_result; nothing was dispatched or the result is unknown. Check codex_status; the codex-gate agent is the gate fallback; for worker jobs, build directly in Claude.' }))
+  }).catch(() => ({ result: 'codex-bridge: internal error in codex_result; nothing was dispatched or the result is unknown. Check codex_status (or /codex-bridge status) before retrying.' }))
 
   on('tool.call', { tool: 'mcp__codex-bridge__codex_discard' }, async ($, e) => {
     const r = await bridge($, ['discard', String(pick(e, ['job_id']).job_id)])
     await refresh($)
     return { result: JSON.stringify(r) }
-  }).catch(() => ({ result: 'codex-bridge: internal error in codex_discard; nothing was dispatched or the result is unknown. Check codex_status; the codex-gate agent is the gate fallback; for worker jobs, build directly in Claude.' }))
+  }).catch(() => ({ result: 'codex-bridge: internal error in codex_discard; nothing was dispatched or the result is unknown. Check codex_status (or /codex-bridge status) before retrying.' }))
 
   on('tool.call', { tool: 'mcp__codex-bridge__codex_cancel' }, async ($, e) => {
     return { result: await cancelJob($, String(pick(e, ['job_id']).job_id)) }
@@ -550,7 +559,7 @@ export const register: Register = on => {
     if (!pk.ok) return { result: `Refused: ${pk.error}` }
     const r = await spawnReviewer($, job, 'diagnose', pk)
     return { result: !r.deny ? `Diagnostic reviewer started for ${job}; its verdict arrives as a hand-back.` : `Could not start reviewer: ${r.deny}` }
-  }).catch(() => ({ result: 'codex-bridge: internal error in codex_diagnose; nothing was dispatched or the result is unknown. Check codex_status; the codex-gate agent is the gate fallback; for worker jobs, build directly in Claude.' }))
+  }).catch(() => ({ result: 'codex-bridge: internal error in codex_diagnose; nothing was dispatched or the result is unknown. Check codex_status (or /codex-bridge status) before retrying.' }))
 
   on('command.run', { command: 'codex-bridge' }, async ($, e) => {
     const [sub = '', ...rest] = e.args.trim().toLowerCase().split(/\s+/).filter(Boolean)
@@ -571,7 +580,7 @@ export const register: Register = on => {
     const result = await next(e)
     if (!e.agentId) return result
 
-    const map = ((await $.store.get(REVIEW_MAP)) as Record<string, { job: string; kind: string; snapshot: string; gen?: number }>) ?? {}
+    const map = ((await $.store.get(REVIEW_MAP)) as Record<string, { job: string; kind: string; snapshot: string; gen?: number; model?: string }>) ?? {}
     const entry = map[e.agentId]
     if (!entry) return result
     delete map[e.agentId]

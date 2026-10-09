@@ -1,114 +1,153 @@
 # codex-bridge
 
-Use OpenAI Codex from inside Claude Code without having to trust what Codex says it did.
+codex-bridge lets Claude Code send work to OpenAI Codex. It checks the work before you use it.
 
-codex-bridge is a Claude Code mod with two lanes:
+codex-bridge starts from the same idea as OpenAI's [codex-plugin-cc](https://github.com/openai/codex-plugin-cc).
+If you know that plugin, you know the basics. The same ground rules apply. Codex uses your account and your usage
+limits. Codex can read the files that your user account can read.
 
-- **Ask / gate.** One tool call sends Codex a question or a read-only critique of a diff. The answer comes back
-  with a *grounding receipt*: proof (by a random-line read canary per file) that Codex actually read the files it
-  was pointed at, the model and effort used, and the Codex quota it cost.
-- **Worker jobs.** Codex builds a change in an isolated git worktree. When it finishes, the bridge re-runs your
-  tests in a sandbox (no network, no secrets, writes limited to the worktree), computes what really changed,
-  compares that with what Codex claimed, and, if everything checks out, has a read-only Claude reviewer judge the
-  diff against your definition of done. You get a verdict. Nothing is ever merged or committed for you.
+codex-bridge adds these seven improvements:
+
+1. **Claude calls Codex directly.** Codex is a set of tools that Claude uses during a task. You do not type slash
+   commands. No relay subagent copies the answer between Codex and Claude.
+2. **Workers do not change your checkout.** Each job runs in a separate git worktree. codex-bridge does not merge,
+   commit or push the changes.
+3. **codex-bridge checks the claims of Codex.** After a worker job, codex-bridge runs your tests again in a sandbox.
+   The sandbox has no network, no secrets, and write access to the worktree only. codex-bridge calculates the real
+   changes and compares them with the claims of Codex.
+4. **The review agrees with the risk.** A clean job gets a read-only Claude review against your definition of done.
+   Mechanical work gets no review. Judgment work gets a Sonnet review. Critical work gets an Opus review.
+5. **Critiques show proof of reading.** For each file in a gate (critique) call, Codex must quote one random line.
+   This shows that Codex read the file. The reply also shows the quota that the call used.
+6. **The risk sets the model.** codex-bridge selects the Codex model and effort from the risk of the task. Claude can
+   increase them. Claude cannot decrease them. codex-bridge checks your usage limits before a job starts.
+7. **Runs go in parallel.** Asks and gates do not wait. Up to three worker jobs can run at the same time. You can
+   change this limit.
+
+| | codex-plugin-cc | codex-bridge |
+|---|---|---|
+| Who calls Codex | you, with slash commands | Claude, with tools, during a task (and `/codex-bridge` for you) |
+| Relay subagent | yes (rescue) | none |
+| Where Codex writes | your checkout | a separate worktree |
+| Work check | none | sandboxed test run, calculated receipt, Claude review by tier |
+| Model choice | you select | from the risk; Claude can only increase it |
+| Send a session to Codex | `/codex:transfer` | not available |
+
+**Token cost.** No relay subagent uses tokens. A separate reviewer does the review. Thus, your main session does not
+read each diff again on later turns. The checks also make the low-cost Codex model safe for worker jobs. In our
+benchmark, that model matched the standard model and used about a quarter of the quota. We did not compare
+codex-bridge directly with codex-plugin-cc. Refer to [the benchmark](docs/benchmark.md).
+
+This diagram shows a worker job. An ask or a gate is one Codex call. Only Codex and the Claude review use tokens.
+codex-bridge runs the tests and calculates the receipt in Python, without a model.
 
 ```mermaid
 flowchart LR
-  A[codex_start] --> B[worktree + Codex]
-  B --> C[sandboxed test re-run]
-  C --> D[computed receipt]
-  D -->|clean| E[Claude reviewer]
+  A[codex_start] --> B[Codex works in a worktree<br/>Codex quota]
+  B --> C[tests run again in a sandbox<br/>no tokens]
+  C --> D[receipt calculated<br/>no tokens]
+  D -->|clean| E[Claude review<br/>by tier]
   D -->|not clean| F[failure report]
-  E --> G[verdict: accept / fix-list / reject]
+  E --> G[verdict]
 ```
-
-The point is that every claim you act on is either **computed** by the bridge or **tagged as Codex's (or the
-reviewer's) words**. A worker that says "all 12 tests pass" is checked against a re-run it could not touch.
 
 ## Requirements
 
-| | |
+| Item | Requirement |
 |---|---|
 | Claude Code | 2.1.287 or later (mods / hooks modules) |
-| Codex CLI | 0.159 or later, logged in (`codex login`) |
-| Python | 3.11 or later on `PATH` as `python3`, `python` or `py -3` (stdlib only, nothing to install) |
-| git | any recent version (worker jobs use `git worktree`) |
+| Codex CLI | 0.159 or later, with a login (`codex login`) |
+| Python | 3.11 or later on `PATH` as `python3`, `python` or `py -3` (standard library only) |
+| git | a recent version (worker jobs use `git worktree`) |
 
-**Platforms.** Ask and gate work wherever Codex runs. Worker jobs are unlocked per machine only after
-`/codex-bridge setup` proves the verify sandbox works there (see [Security](SECURITY.md)). The sandbox has been
-proven on **macOS**. Linux and Windows have code paths and unit tests but no proven sandbox run yet; on those,
-setup tells you whether workers unlock.
+**Platforms.** Asks and gates work on all platforms where Codex runs. Worker jobs work on a machine only after
+`/codex-bridge setup` proves the sandbox on that machine. Refer to [SECURITY.md](SECURITY.md). We proved the sandbox
+on macOS. Linux and Windows have code and unit tests, but we did not prove the sandbox on them. On these platforms,
+setup tells you if worker jobs can run.
 
 ## Install
 
-In a Claude Code terminal session:
+1. In a Claude Code terminal session, type this command:
 
-```text
-/plugin install codex-bridge --marketplace projectsofwill/codex-bridge
-```
+   ```text
+   /plugin install codex-bridge --marketplace projectsofwill/codex-bridge
+   ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope is the usual choice). Then run the one-time
-check:
+2. Type `y` to add the marketplace.
+3. Select a scope. The user scope is the usual selection.
+4. Run the one-time check:
 
-```text
-/codex-bridge setup
-```
+   ```text
+   /codex-bridge setup
+   ```
 
-Setup finds Python, validates your config (if you have one), reads your Codex usage limits, and runs the sandbox
-selftest. Each selftest probe is reported: things that must fail (writing outside the worktree, reading `.env`,
-reaching the network, seeing a secret environment variable) and things that must work. Worker jobs stay locked on
-a machine until its selftest passes, and the proof is tied to the Codex CLI version, so a Codex upgrade asks for
-it again.
+Setup finds Python, validates your configuration file, reads your Codex usage limits, and runs the sandbox
+selftest. The output shows the result of each selftest probe. Some probes must fail: a write outside the worktree,
+a read of `.env`, a network connection, and a read of a secret environment variable. Other probes must succeed.
+Worker jobs stay locked on a machine until its selftest passes. The proof applies to one Codex CLI version. After
+a Codex upgrade, run setup again.
 
-## Using it
+## Use
 
-You mostly talk to Claude as usual; Claude calls the tools. The tools:
+Talk to Claude as usual. Claude calls the tools. The tools are:
 
-| Tool | What it does |
+| Tool | Function |
 |---|---|
-| `codex` | `mode: "ask"` for a second opinion, `mode: "gate"` for a grounded critique of a literal diff. A gate call names its `trigger` (the stakes: `irreversible`, `trust-boundary`, `unattended`, `policy`), which picks the model and effort. |
-| `codex_start` | Start a worker job: task, scope, verify command, risk tier (`R0`/`R1`/`R2`), definition of done, the test files the verify run trusts, and a short written judgment that the task is safe to delegate. Returns at once; the job runs detached and survives the session. |
-| `codex_status` | Jobs, the Codex slot holder, live usage limits. |
-| `codex_result` | A job's receipt (computed vs claimed) and review verdict. |
-| `codex_cancel` | Stop a pending or running job. Its worktree is kept. |
-| `codex_discard` | Remove a finished job's worktree, after you merged or rejected it. |
-| `codex_diagnose` | Run the reviewer on a job that did *not* come out clean: defect, bad test, or spec conflict? |
+| `codex` | `mode: "ask"` gets a second opinion. `mode: "gate"` gets a critique of a literal diff with proof of reading. A gate call names its `trigger` (the risk: `irreversible`, `trust-boundary`, `unattended`, `policy`). The trigger sets the model and effort. |
+| `codex_start` | Starts a worker job. Inputs: task, scope, verify command, risk tier (`R0`/`R1`/`R2`), definition of done, the test files that the verify run uses, and a short statement that the task is safe to send. The tool returns immediately. The job runs in the background and continues after the session ends. When the job ends, codex-bridge stops the processes that stay in its worktree. |
+| `codex_status` | Shows the jobs, the Codex runs on this machine, and the usage limits. |
+| `codex_result` | Shows the receipt of a job (calculated and claimed) and the review verdict. |
+| `codex_cancel` | Stops a pending or running job. codex-bridge keeps its worktree. |
+| `codex_discard` | Removes the worktree of a finished job. Use it after you merge or reject the job. |
+| `codex_diagnose` | Runs the reviewer on a job that is not clean. The reviewer finds the cause: a defect, a bad test, or a spec conflict. |
 
-And one slash command for you:
+You can also use one slash command:
 
 ```text
 /codex-bridge setup | status | result <job_id> | cancel <job_id>
 ```
 
-A band above the prompt shows running jobs and an in-flight ask, plus your Codex limits once a window passes 70%.
+A band above the prompt shows the running jobs and a running ask. When a usage window is more than 70% used, the
+band also shows your Codex limits.
 
-### What "clean" means
+### Clean jobs
 
-A worker job is `clean` only when **all** of these hold: Codex exited normally, the change scan completed, the
-sandboxed test re-run passed with at least one test executed, its result matches what Codex claimed, nothing was
-written outside the declared scope, no unexpected ignored files appeared, and the test files you listed were not
-changed (unless you allowed it, in which case the reviewer must account for every changed test). Anything else
-gets a specific outcome: `verify-failed`, `mismatch`, `out-of-scope`, `verifier-modified`, `incomplete-scan`,
-`timeout`, `crashed`, `refused`.
+A worker job is `clean` only when all of these conditions are true:
 
-Only clean jobs get an automatic review. The reviewer is read-only (Read, Grep, Glob), reviews an immutable packet,
-and must return a requirement-by-requirement verdict bound to a hash of the exact diff it saw. An `accept` with an
-unmet requirement or an undisposed test change is downgraded to `fix-list` in code. `accept` means "recommend
-merge"; merging is yours.
+- Codex stopped normally.
+- The change scan is complete.
+- The sandboxed test run passed, and at least one test ran.
+- The test result agrees with the claim of Codex.
+- Codex wrote no files outside the declared scope.
+- No unexpected ignored files appeared.
+- The test files that you listed did not change. (You can allow test changes. Then the reviewer must examine each
+  changed test.)
 
-### Review depth by tier
+If a job is not clean, it gets a specific outcome: `verify-failed`, `mismatch`, `out-of-scope`,
+`verifier-modified`, `incomplete-scan`, `timeout`, `crashed` or `refused`.
 
-| Tier | Default model / effort | Auto-review |
+Only clean jobs get an automatic review. The reviewer can only read (Read, Grep, Glob). It reviews a packet that
+cannot change. It must give a verdict for each requirement. The verdict includes a hash of the diff that it
+reviewed. If an `accept` has an unmet requirement or an unexamined test change, the code changes it to `fix-list`.
+`accept` means "merge is recommended". You do the merge.
+
+### Review by tier
+
+| Tier | Default model / effort | Automatic review |
 |---|---|---|
-| R0 (mechanical) | standard / medium | none: the receipt and re-run are the check (Sonnet if tests changed) |
+| R0 (mechanical) | standard / medium | none: the receipt and the test run are the check (Sonnet if tests changed) |
 | R1 (judgment) | standard / medium | Sonnet |
 | R2 (correctness-critical) | standard / high | Opus |
 
+The reviewer model is set for each tier. It does not come from the model of your session. Each review records the
+model that it used in the cost log.
+
 ## Configuration
 
-Everything has a default. To change it, create `~/.codex-bridge/config.json` with only the keys you want to
-override (unknown keys are refused, and a malformed file refuses every command rather than silently running a
-policy you didn't write). Changes apply at the next session start; `/codex-bridge setup` validates the file.
+All settings have a default. To change a setting, make the file `~/.codex-bridge/config.json`. Put only the keys
+that you want to change in it. codex-bridge refuses unknown keys. If the file is not valid, codex-bridge refuses
+all commands. This prevents a policy that you did not write. Changes apply when the next session starts. To
+validate the file, run `/codex-bridge setup`.
 
 ```json
 {
@@ -125,76 +164,43 @@ policy you didn't write). Changes apply at the next session start; `/codex-bridg
   "protected_paths": ["infra/", "deploy.yaml"],
   "workspace_roots": ["~/work"],
   "log_path": null,
-  "worker_refuse_pct": { "primary": 70, "secondary": 85 }
+  "worker_refuse_pct": { "primary": 70, "secondary": 85 },
+  "max_workers": 3
 }
 ```
 
-| Key | Meaning |
+| Key | Function |
 |---|---|
-| `models` | Model ids for three roles. `cheap` may only run worker jobs (whose work is verified and reviewed); gates never run below `standard`. |
-| `stakes` | Gate stakes → `[role, effort]`. A gate call must name the stakes that make it a gate. |
-| `stakes_aliases` | Your own names for stakes (e.g. your team calls it "backbone"). |
-| `tiers` | Worker tier → `[role, effort]`. Claude may raise a model or effort, never lower it. |
-| `review` | Reviewer per tier: `none`, `sonnet` or `opus`. |
-| `protected_paths` | Added to the built-in list (`.claude/`, `.codex/`, `.github/workflows/`, `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, settings files). A worker may read these but not write them; it can propose an edit as a separate patch that is shown, never applied. `dir/` is a prefix, anything else a file name. You can add, never remove. |
-| `workspace_roots` | Extra directories the verify sandbox denies and whose protected areas also apply. |
-| `log_path` | Where the per-call cost log (JSONL) goes. Default `~/.codex-bridge/burn.jsonl`. |
-| `worker_refuse_pct` | Refuse a new worker above this % of the 5-hour (`primary`) or weekly (`secondary`) Codex window, until 3 measured runs exist; after that the bridge refuses when the median measured cost won't fit. |
+| `models` | Model IDs for three roles. Only worker jobs can use `cheap`, because codex-bridge checks and reviews their work. Gates always use `standard` or higher. |
+| `stakes` | Maps each gate risk to `[role, effort]`. A gate call must name its risk. |
+| `stakes_aliases` | Your own names for the risks (for example, "backbone"). |
+| `tiers` | Maps each worker tier to `[role, effort]`. Claude can increase a model or effort. Claude cannot decrease it. |
+| `review` | The reviewer for each tier: `none`, `sonnet` or `opus`. |
+| `protected_paths` | Adds paths to the built-in list (`.claude/`, `.codex/`, `.github/workflows/`, `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, settings files). A worker can read these paths. A worker cannot write them. A worker can propose a change in a separate patch. codex-bridge shows the patch and does not apply it. `dir/` is a prefix. All other values are file names. You can add paths. You cannot remove the built-in paths. |
+| `workspace_roots` | More directories that the sandbox blocks. Their protected paths also apply. |
+| `log_path` | The location of the cost log (JSONL). The default is `~/.codex-bridge/burn.jsonl`. |
+| `worker_refuse_pct` | codex-bridge refuses a new worker above this percentage of the 5-hour (`primary`) or weekly (`secondary`) Codex window. This rule applies until 3 measured runs exist. After that, codex-bridge refuses a worker when the median measured cost does not fit. This calculation includes the workers that are running. |
+| `max_workers` | The number of worker jobs that can run at the same time on this machine (default 3; `0` = no limit). Asks and gates have no limit and do not wait. This limit is not a Codex limit: one login can do many runs at the same time. Each worker also starts a sandboxed test run and a Claude review. |
 
-Environment overrides: `CODEX_BRIDGE_HOME` (state directory, default `~/.codex-bridge`), `CODEX_BRIDGE_CONFIG`
-(config path), `CODEX_BRIDGE_CODEX` (the `codex` binary).
+Environment variables: `CODEX_BRIDGE_HOME` sets the state directory (default `~/.codex-bridge`).
+`CODEX_BRIDGE_CONFIG` sets the configuration path. `CODEX_BRIDGE_CODEX` sets the `codex` binary.
 
-## Limits and honest caveats
+## More information
 
-- **One Codex dispatch at a time per machine.** Bridge calls queue on a lock (an ask waits up to 2 minutes, then
-  refuses). Codex you run by hand, other tools that run Codex, and other machines are **not** coordinated.
-- **The worker's own read access is restricted by prompt, not sandbox.** Its writes go to an isolated worktree and
-  are scope-checked afterwards, and the test re-run *is* sandboxed, but while Codex works it can read what your
-  user can read. See [SECURITY.md](SECURITY.md).
-- **Grounding is evidence, not proof of review.** The read canary shows Codex opened the file; it can't show Codex
-  thought hard about it.
-- **Usage limits are read from an experimental Codex endpoint.** If the read fails, limits show as unknown and
-  nothing is blocked on them except an already-hit limit.
-- **Process cleanup is best-effort.** At the end of a job the bridge kills Codex's process tree and orphaned
-  processes born during the run inside the worktree. Don't start long-running processes inside a running job's
-  worktree.
-- Nothing is merged, committed, pushed or chained automatically.
-
-## How it compares
-
-[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) is OpenAI's official plugin: slash
-commands you type (`/codex:review`, `/codex:rescue`, ...), with delegation relayed through a Claude subagent
-and Codex working directly in your checkout. codex-bridge is built for Claude delegating on its own:
-
-| | codex-plugin-cc | codex-bridge |
-|---|---|---|
-| Who calls Codex | you, via slash commands | Claude, as a tool, mid-task (plus `/codex-bridge` for you) |
-| Relay subagent | yes (rescue) | none: Codex's answer reaches Claude directly |
-| Where Codex writes | your checkout | an isolated worktree; nothing merged for you |
-| Checking the work | none built in | sandboxed test re-run, computed receipt, tiered Claude review |
-| Model choice | you pick | picked from the stakes; Claude may only raise |
-| Hand a session to Codex | `/codex:transfer` | not yet |
-
-Token cost: there is no relay to pay for, and review runs in a separate reviewer, so your main session doesn't
-re-read every diff on later turns. Verification also makes it safe to run the cheap Codex model, which in our
-benchmark matched the standard one at about a quarter of the quota. We have not benchmarked against
-codex-plugin-cc directly ([numbers](docs/benchmark.md)).
-
-## More
-
-- [docs/design.md](docs/design.md): how it works, state machine, and the reasons behind the rules.
-- [docs/benchmark.md](docs/benchmark.md): the head-to-head runs the design was tuned on.
-- [SECURITY.md](SECURITY.md): what leaves your machine, what the sandbox guarantees, how to report a vulnerability.
+- [docs/design.md](docs/design.md): how codex-bridge works and why each rule exists.
+- [docs/benchmark.md](docs/benchmark.md): the test runs that we used to tune the design.
+- [SECURITY.md](SECURITY.md): the data that leaves your machine, the sandbox limits, and how to report a
+  vulnerability.
 
 ## Development
 
 ```bash
 cd plugins/codex-bridge
-python3 -m unittest discover -s bridge/tests   # core, offline (a fake codex binary)
-claude plugin test .                            # the mod layer
+python3 -m unittest discover -s bridge/tests   # core tests, offline (with a fake codex binary)
+claude plugin test .                            # mod tests
 claude plugin validate .
 ```
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. Refer to [LICENSE](LICENSE) and [NOTICE](NOTICE).
