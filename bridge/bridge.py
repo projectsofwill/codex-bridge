@@ -329,7 +329,19 @@ def kill_identities(idents):
             if not any(alive(i) for i in live):
                 break
             time.sleep(0.1)
+        reap(live)
     return not any(alive(i) for i in idents)
+
+
+def reap(idents):
+    """Collect zombies of killed processes that are our children (orphans adopted as Linux subreaper).
+    By pid only, never waitpid(-1): that could take the status a live Popen still waits for. The only
+    Popen pid that can appear here is a contained child end_tree already waited for."""
+    for ident in idents:
+        try:
+            os.waitpid(int(ident.split(":")[0]), os.WNOHANG)
+        except (ChildProcessError, OSError, ValueError, AttributeError):
+            pass  # not our child, already reaped, or Windows
 
 
 def _reclaim(path, seen):
@@ -1342,8 +1354,11 @@ def descendants(pid):
 
 def worktree_procs(wt, since):
     """Escaped writers: processes whose cwd is inside the worktree AND that are orphaned (parent died,
-    reparented to launchd/init) AND were born after `since`. That is the setsid/double-fork escape.
-    A process with a living parent (a shell, a terminal's child) is never matched. A detached process a
+    reparented to launchd/init, or to this supervisor as Linux subreaper, from another session) AND were
+    born after `since`. That is the setsid/double-fork escape. A process with any other living parent (a
+    shell, a terminal's child, a direct child of ours in our session) is never matched. A direct child in
+    another session IS matched: fine for a supervisor (a job-dedicated process), not for a shared caller
+    that starts unrelated detached children in the worktree (the in-process test seam). A detached process a
     PERSON starts in a job's worktree during the run (`nohup ... &`, a GUI app opened there) IS matched
     and killed: worktrees are bridge-owned, so don't run things in one while its job runs. Best-effort:
     an escape that also leaves the worktree is not found here."""
@@ -1360,7 +1375,7 @@ def worktree_procs(wt, since):
     found = set()
     for pid in cands:
         info = run(["ps", "-o", "ppid=,lstart=", "-p", str(pid)]).stdout.strip().split(None, 1)
-        if len(info) < 2 or info[0] != "1":
+        if len(info) < 2 or not (info[0] == "1" or (info[0] == str(os.getpid()) and foreign_session(pid))):
             continue
         try:
             born = time.mktime(time.strptime(info[1].strip(), "%a %b %d %H:%M:%S %Y"))
@@ -1379,9 +1394,34 @@ def cmd_supervise(jid):
         raise
 
 
+def become_subreaper():
+    """Linux: orphans of our descendants reparent to us, not to init. Under systemd (user manager) or a
+    CI runner, the nearest subreaper is otherwise some other living process, so an escaped child's ppid
+    is not 1 and worktree_procs would never match it. No-op elsewhere (macOS orphans go to launchd, pid 1)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+        return prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+    except (OSError, AttributeError):
+        return False
+
+
+def foreign_session(pid):
+    """True when `pid` is not in our session: Codex runs in its own (popen_contained), so an orphan
+    reparented to us from its tree is foreign, while our own direct children are not."""
+    try:
+        return os.getsid(pid) != os.getsid(0)
+    except OSError:
+        return False
+
+
 def _supervise(jid):
     if not claim(jid, "supervise"):
         return  # a supervisor already ran (or runs) for this job: never two
+    become_subreaper()
     job = read_json(job_dir(jid) / "job.json")
     transition(jid, "pending", supervisor=identity())
     holder, token = lock_acquire({"kind": "worker", "job": jid}, LOCK_WAIT_WORKER_S, takeover_job=jid)

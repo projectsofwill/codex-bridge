@@ -6,7 +6,7 @@
     {
       "name": "codex-bridge",
       "description": "Ask Codex for a second opinion or a grounded critique, or hand it a worker job that is re-verified and reviewed before you merge.",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "source": "./"
     }
   ]
