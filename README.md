@@ -162,11 +162,23 @@ Environment overrides: `CODEX_BRIDGE_HOME` (state directory, default `~/.codex-b
 
 ## How it compares
 
-[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) is OpenAI's own Claude Code plugin for
-delegating to Codex, and the natural first choice for most people. codex-bridge is narrower and stricter: it
-assumes you want to *verify* delegated work before trusting it, so it adds worktree isolation, a sandboxed re-run,
-computed receipts, protected paths, stakes-based model choice and a tiered Claude review. If you don't need those,
-the official plugin is simpler.
+[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) is OpenAI's official plugin: slash
+commands you type (`/codex:review`, `/codex:rescue`, ...), with delegation relayed through a Claude subagent
+and Codex working directly in your checkout. codex-bridge is built for Claude delegating on its own:
+
+| | codex-plugin-cc | codex-bridge |
+|---|---|---|
+| Who calls Codex | you, via slash commands | Claude, as a tool, mid-task (plus `/codex-bridge` for you) |
+| Relay subagent | yes (rescue) | none: Codex's answer reaches Claude directly |
+| Where Codex writes | your checkout | an isolated worktree; nothing merged for you |
+| Checking the work | none built in | sandboxed test re-run, computed receipt, tiered Claude review |
+| Model choice | you pick | picked from the stakes; Claude may only raise |
+| Hand a session to Codex | `/codex:transfer` | not yet |
+
+Token cost: there is no relay to pay for, and review runs in a separate reviewer, so your main session doesn't
+re-read every diff on later turns. Verification also makes it safe to run the cheap Codex model, which in our
+benchmark matched the standard one at about a quarter of the quota. We have not benchmarked against
+codex-plugin-cc directly ([numbers](docs/benchmark.md)).
 
 ## More
 
