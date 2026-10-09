@@ -6,7 +6,7 @@ for example `(2c.5)`. These markers refer to the build history that this documen
 ## Structure
 
 ```
-plugins/codex-bridge/
+codex-bridge/
   hooks/register.tsx   thin Claude Code layer: tools, slash command, band, reviewer start, watcher timer
   bridge/bridge.py     the logic, standard-library Python: slots, jobs, supervisor, sandbox, receipt, read checks, cost log
   bridge/prompts/      the prompts for Codex and the reviewer (ask, gate, resume, worker, reviewer)

@@ -60,7 +60,7 @@ proof applies to one Codex version, one operating system and one machine.
 
 1. On GitHub, open this repository.
 2. Select **Security**, then **Report a vulnerability**. This makes a private security advisory.
-3. Include the version (from `plugins/codex-bridge/.claude-plugin/plugin.json`), your operating system, the output
+3. Include the version (from `.claude-plugin/plugin.json`), your operating system, the output
    of `codex --version`, and the minimum steps to show the problem.
 
 Do not open a public issue for a vulnerability. One person maintains this project. You get a reply in one week or

@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Unit tests (offline, fake codex)
-        working-directory: plugins/codex-bridge
+        working-directory: .
         run: python3 -m unittest discover -s bridge/tests -v
 
   mod:
@@ -41,6 +41,6 @@ jobs:
       - name: Install Claude Code (pinned)
         run: npm install -g @anthropic-ai/claude-code@2.1.295
       - name: Validate
-        run: claude plugin validate plugins/codex-bridge
+        run: claude plugin validate .
       - name: Mod tests
-        run: claude plugin test plugins/codex-bridge
+        run: claude plugin test .

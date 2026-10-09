@@ -185,6 +185,13 @@ validate the file, run `/codex-bridge setup`.
 Environment variables: `CODEX_BRIDGE_HOME` sets the state directory (default `~/.codex-bridge`).
 `CODEX_BRIDGE_CONFIG` sets the configuration path. `CODEX_BRIDGE_CODEX` sets the `codex` binary.
 
+## What this plugin sends and runs
+
+- **Sends to OpenAI:** your prompt, the literal diff, and the files you name go to Codex under your own Codex account. In worker jobs, Codex also reads files in its worktree. Secret paths (`.env*`, keys, `.git`, `.ssh`, `.aws`) are refused as targets.
+- **Runs on your machine:** the `codex` CLI, a Python script (`bridge/bridge.py`, standard library only), and your test command, which is re-run in a network-off `codex sandbox`. Worker jobs run in an isolated git worktree.
+- **Writes locally:** job records and a cost log in `~/.codex-bridge/`. Nothing is sent anywhere else.
+- **Limits:** the sandbox uses a block list, not an allow list. [SECURITY.md](SECURITY.md) lists exactly what is blocked and what is not.
+
 ## More information
 
 - [docs/design.md](docs/design.md): how codex-bridge works and why each rule exists.
@@ -195,7 +202,6 @@ Environment variables: `CODEX_BRIDGE_HOME` sets the state directory (default `~/
 ## Development
 
 ```bash
-cd plugins/codex-bridge
 python3 -m unittest discover -s bridge/tests   # core tests, offline (with a fake codex binary)
 claude plugin test .                            # mod tests
 claude plugin validate .
