@@ -1,0 +1,7 @@
+# engine-generated editor types (per machine, per Claude Code build)
+.claude-plugin/types/
+plugins/*/.claude-plugin/types/
+__pycache__/
+.pytest_cache/
+node_modules/
+.DS_Store

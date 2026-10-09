@@ -1,0 +1,12 @@
+{
+  "name": "codex-bridge",
+  "version": "0.2.0",
+  "description": "Codex as direct tools (second opinion, grounded critique gate) plus supervised worker jobs: isolated worktree, sandboxed test re-run, computed receipt, scope and test-freeze checks, Claude review by tier, stakes-based model choice, live usage-limit preflight. Configurable via ~/.codex-bridge/config.json.",
+  "types": "./types/index.d.ts",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/projectsofwill/codex-bridge",
+  "author": {
+    "name": "projectsofwill",
+    "url": "https://github.com/projectsofwill"
+  }
+}

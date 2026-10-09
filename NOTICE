@@ -1,0 +1,8 @@
+codex-bridge
+Copyright 2026 projectsofwill
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+codex-bridge invokes the OpenAI Codex CLI and runs inside Claude Code. Neither is
+distributed with this product, and this product is not affiliated with or endorsed
+by OpenAI or Anthropic.

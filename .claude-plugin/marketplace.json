@@ -1,0 +1,13 @@
+{
+  "name": "codex-bridge",
+  "description": "Codex inside Claude Code, with its work verified: sandboxed test re-runs, computed receipts, and a Claude reviewer sized to the stakes.",
+  "owner": { "name": "projectsofwill" },
+  "plugins": [
+    {
+      "name": "codex-bridge",
+      "description": "Ask Codex for a second opinion or a grounded critique, or hand it a worker job that is re-verified and reviewed before you merge.",
+      "version": "0.2.0",
+      "source": "./plugins/codex-bridge"
+    }
+  ]
+}
