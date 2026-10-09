@@ -881,7 +881,7 @@ class Worker(Base):
         self.assertEqual(r["outcome"], "out-of-scope")
 
     def test_verify_env_has_no_secrets_and_descendants_die(self):  # gate findings 2 + 3
-        os.environ["CODEX_BRIDGE_TEST_SECRET"] = "s3cr3t-value"
+        os.environ["CODEX_BRIDGE_TEST_CANARY"] = "canary-value"
         try:
             verify = ("env > env-dump.txt; (sleep 300 &) ; echo '==== 3 passed in 0.10s ===='")
             jid = self.inproc(verify=verify, REPLY=CLAIM_OK)
@@ -890,9 +890,9 @@ class Worker(Base):
             after = set(subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True).stdout.split())
             self.assertFalse(after - before, "verify's background child survived")
             dump = (self.b.worktree_dir(jid) / "env-dump.txt").read_text()
-            self.assertNotIn("s3cr3t-value", dump)
+            self.assertNotIn("canary-value", dump)
         finally:
-            del os.environ["CODEX_BRIDGE_TEST_SECRET"]
+            del os.environ["CODEX_BRIDGE_TEST_CANARY"]
 
     def test_tracked_or_non_generated_artifact_paths_still_counted(self):  # gate finding 5
         (self.repo / "__pycache__").mkdir()
@@ -1280,7 +1280,7 @@ class V011(Base):
         self.assertFalse(proof["results"]["read-dotenv"]["pass"])
         self.assertFalse(proof["results"]["write-outside"]["pass"])
         self.assertTrue(proof["results"]["runs"]["pass"])
-        self.assertTrue(proof["results"]["env-secret-absent"]["pass"])   # the env allowlist works even unsandboxed
+        self.assertTrue(proof["results"]["env-canary-absent"]["pass"])   # the env allowlist works even unsandboxed
         self.assertFalse(self.b.selftest_ok("codex-cli 0.0.0-fake"))
         self.assertFalse(list(self.home.glob("selftest-outside-*")))     # probe litter removed
 

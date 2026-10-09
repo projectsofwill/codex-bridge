@@ -2073,7 +2073,7 @@ def cmd_selftest():
     wt.mkdir(parents=True)
     (wt / ".env").write_text("SELFTEST_ENV=1\n", encoding="utf-8")
     outside = HOME / f"selftest-outside-{uuid.uuid4().hex[:8]}.txt"
-    os.environ["CODEX_BRIDGE_SELFTEST_SECRET"] = uuid.uuid4().hex  # must NOT reach the sandboxed child
+    os.environ["CODEX_BRIDGE_SELFTEST_CANARY"] = uuid.uuid4().hex  # must NOT reach the sandboxed child
     ws_file = next((r / "README.md" for r in WORKSPACE_ROOTS if (r / "README.md").is_file()), None)
     probes = [  # (name, python code, must succeed)
         ("runs", "print('ok')", True),
@@ -2081,7 +2081,7 @@ def cmd_selftest():
         ("write-outside", f"open({str(outside)!r}, 'w').write('x')", False),
         ("read-dotenv", "print(open('.env').read())", False),
         ("network", "import socket; socket.create_connection(('1.1.1.1', 443), timeout=5)", False),
-        ("env-secret-absent", "import os, sys; sys.exit(1 if os.environ.get('CODEX_BRIDGE_SELFTEST_SECRET') else 0)", True),
+        ("env-canary-absent", "import os, sys; sys.exit(1 if os.environ.get('CODEX_BRIDGE_SELFTEST_CANARY') else 0)", True),
     ]
     if ws_file:
         probes.append(("read-workspace", f"print(open({str(ws_file)!r}).read()[:10])", False))
@@ -2100,7 +2100,7 @@ def cmd_selftest():
             ok = ok and not outside.exists()
         results[name] = {"pass": ok, "rc": rc, "must_succeed": must_work, "tail": text[-300:]}
     outside.unlink(missing_ok=True)
-    os.environ.pop("CODEX_BRIDGE_SELFTEST_SECRET", None)
+    os.environ.pop("CODEX_BRIDGE_SELFTEST_CANARY", None)
     proof = {"passed": all(r["pass"] for r in results.values()), "codex_version": version,
              "platform": platform.system(), "machine": machine(), "at": now(), "results": results}
     write_json(HOME / "selftest.json", proof)
