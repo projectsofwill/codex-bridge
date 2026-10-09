@@ -2,6 +2,7 @@
 import importlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -866,8 +867,17 @@ class Worker(Base):
         before = set(subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True).stdout.split())
         self.b.cmd_supervise(jid)
         after = set(subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True).stdout.split())
-        self.assertFalse(after - before, "child left by a normally-exiting Codex survived")
+        self.assertFalse(after - before, "child left by a normally-exiting Codex survived\n" + self.survivor_report(after - before, jid))
         self.assertEqual(self.b.lock_holder(), [])
+
+    def survivor_report(self, pids, jid):
+        """What the sweep saw, so a CI-only failure explains itself (ppid/sid decide worktree_procs)."""
+        if not pids:
+            return ""
+        ps = subprocess.run(["ps", "-o", "pid,ppid,sid,stat,lstart,args", "-p", ",".join(pids)], capture_output=True, text=True).stdout
+        cwds = {p: (os.readlink(f"/proc/{p}/cwd") if os.path.exists(f"/proc/{p}/cwd") else "?") for p in pids}
+        return (f"{ps}cwd: {cwds}\nworktree: {self.b.worktree_dir(jid).resolve()}\nus: pid {os.getpid()} sid {os.getsid(0)}"
+                f"\nsubreaper: {self.b.become_subreaper()} lsof: {shutil.which('lsof')}")
 
     def test_denied_path_written_inside_broad_scope(self):  # finding 2
         jid = self.inproc(verify="echo '==== 3 passed in 0.10s ===='", REPLY=CLAIM_OK)
