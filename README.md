@@ -62,8 +62,13 @@ flowchart LR
 
 **Platforms.** Asks and gates work on all platforms where Codex runs. Worker jobs work on a machine only after
 `/codex-bridge setup` proves the sandbox on that machine. Refer to [SECURITY.md](SECURITY.md). We proved the sandbox
-on macOS. Linux and Windows have code and unit tests, but we did not prove the sandbox on them. On these platforms,
-setup tells you if worker jobs can run.
+on macOS, and on one Windows 11 machine with Codex CLI 0.159.2 and its elevated sandbox backend. Linux has code and
+unit tests, but we did not prove the sandbox on it. On every platform, setup tells you if worker jobs can run.
+
+**Windows.** Verification runs under the elevated backend, which runs code as Codex's dedicated sandbox accounts.
+Codex sets up those accounts once per Codex home. If the Codex sandbox service is installed, setup is silent. If it
+is not, Windows can show an administrator (UAC) prompt, including during a job that gets a new Codex home. If you
+decline the prompt, the job fails and nothing runs. The Python unit tests are not ported to Windows.
 
 ## Install
 

@@ -1611,7 +1611,10 @@ def sandbox_home(at=None, reads=()):
     deny = ["~/.ssh", "~/.codex", "~/.aws", "~/.config", "~/.claude", "~/Library/Keychains",
             "~/Documents", "~/Desktop", "~/Downloads", str(HOME / "jobs"), str(HOME / "runs"),
             *(str(r) for r in WORKSPACE_ROOTS)]
-    lines = ['[permissions.bridge-verify]',
+    # Windows: this private CODEX_HOME never sees ~/.codex/config.toml, and the default (unelevated) backend
+    # refuses restricted read-only access, so every probe failed until the elevated backend was named here.
+    lines = ['[windows]', 'sandbox = "elevated"', ""] if IS_WIN else []
+    lines += ['[permissions.bridge-verify]',
              'description = "codex-bridge verify re-run: write worktree+tmp only, no secrets, no network"',
              'extends = ":read-only"', "", "[permissions.bridge-verify.filesystem]", '":tmpdir" = "write"']
     lines += [f'{json.dumps(d)} = "deny"' for d in dict.fromkeys(deny)]
